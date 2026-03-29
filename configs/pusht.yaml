@@ -1,0 +1,94 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+
+# ── Experiment ──
+experiment_name: mechjepa_pusht
+seed: 42
+
+# ── Wandb ──
+wandb:
+  enable: true
+  project: mechjepa
+  entity: null
+  name: mechjepa_pusht_v1
+
+# ── Data ──
+dataset_name: pusht
+embedding_dir: null
+cache_dir: null
+
+# ── Training ──
+trainer:
+  max_epochs: 200
+  strategy: ddp
+  devices: auto
+  accelerator: gpu
+  precision: 16-mixed
+  log_every_n_steps: 10
+
+batch_size: 128
+num_workers: 8
+frameskip: 1
+
+# ── Dynamics ──
+dinowm:
+  history_size: 3
+  num_preds: 1
+
+n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size}'}
+
+# ── Slots ──
+videosaur:
+  NUM_SLOTS: 7  # may differ for Push-T
+  SLOT_DIM: 128
+
+# ── Masking ──
+num_masked_slots: 2
+
+# ── Predictor ──
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+
+# ── Codebook ──
+codebook:
+  num_mechanisms: 16
+  temperature: 0.1
+  commitment_weight: 0.25
+  diversity_weight: 0.1
+  dead_threshold: 0.01
+  edge_hidden_dim: 256
+  maintenance_every_n_epochs: 5
+
+# ── System M ──
+system_m:
+  surprise_threshold: 1.0
+  enabled: false
+
+# ── CTT ──
+ctt_inv_weight: 0.0
+ctt_suf_weight: 0.0
+ctt_adj_threshold: 0.3
+ctt_start_epoch: 20
+
+# ── Learning Rates ──
+predictor_lr: 5e-4
+codebook_lr: 1e-3
+
+# ── Rollout ──
+rollout:
+  save_rollout: false
+  rollout_batch_size: 64
+  rollout_only: false
+  rollout_checkpoint: null
+
+output_model_name: mechjepa_pusht
+dump_object: true

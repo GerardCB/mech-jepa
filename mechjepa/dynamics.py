@@ -1,0 +1,571 @@
+"""
+Slot Transformer Dynamics with Mechanism Bias — MechJEPA's prediction engine.
+
+Adapted from ctt-jepa's MaskedSlotPredictor. The key modifications:
+  1. MechanismAttention: custom attention layer that adds mechanism-derived bias
+     to attention logits before softmax
+  2. MechanismFFN: feed-forward network that takes mechanism context as additional input
+  3. Same masking & positional embedding strategy as C-JEPA for compatibility
+
+The mechanism codebook biases which interactions happen (via attention bias)
+and how information flows (via FFN context), while the original slot transformer
+architecture handles the temporal prediction.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Mechanism-Aware Attention
+# ---------------------------------------------------------------------------
+
+
+class MechanismAttention(nn.Module):
+    """
+    Multi-head self-attention with mechanism bias.
+
+    Standard attention computes: attn = softmax(Q @ K^T / sqrt(d))
+    We ADD a mechanism-derived bias:
+        attn = softmax(Q @ K^T / sqrt(d) + bias_proj(m_ij))
+
+    This biases the model to route information through mechanism-appropriate
+    pathways without overriding the learned attention patterns.
+
+    Args:
+        dim: model dimension
+        heads: number of attention heads
+        dim_head: dimension per head
+        dropout: attention dropout
+    """
+
+    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.dim_head = dim_head
+
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+        self.attn_dropout = nn.Dropout(dropout)
+
+        # Mechanism bias projection: (D) -> (heads) per slot pair
+        self.bias_proj = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, heads),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        m_ij: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Args:
+            x: (B, T*S, D) — flattened slot sequence
+            m_ij: (B, S, S, D) — bound mechanism vectors (None = no bias)
+            return_attention: whether to return attention weights
+
+        Returns:
+            output: (B, T*S, D)
+            attn_weights: (B, T*S, T*S) if return_attention else None
+        """
+        x = self.norm(x)
+        B, N, _ = x.shape
+
+        # Standard Q, K, V
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b n (h d) -> b h n d", h=self.heads) for t in qkv)
+
+        # Attention logits
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
+
+        # Add mechanism bias if available
+        if m_ij is not None:
+            mech_bias = self._compute_mech_bias(m_ij, N)  # (B, H, N, N)
+            attn_logits = attn_logits + mech_bias
+
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.to_out(out)
+
+        if return_attention:
+            return out, attn.mean(dim=1)  # average over heads
+        return out, None
+
+    def _compute_mech_bias(self, m_ij: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """
+        Compute mechanism-derived attention bias.
+
+        m_ij is (B, S, S, D) — slot-to-slot mechanism vectors.
+        We need to expand this to (B, H, T*S, T*S) for the full sequence.
+
+        The bias is shared across all time steps: the mechanism between
+        slot i and slot j is the same regardless of which timestep they're in.
+
+        Args:
+            m_ij: (B, S, S, D)
+            seq_len: T*S — total sequence length
+
+        Returns:
+            bias: (B, H, T*S, T*S)
+        """
+        B, S, _, D = m_ij.shape
+        T = seq_len // S
+
+        # Project mechanism vectors to per-head biases: (B, S, S, H)
+        bias_ss = self.bias_proj(m_ij)  # (B, S, S, H)
+        bias_ss = bias_ss.permute(0, 3, 1, 2)  # (B, H, S, S)
+
+        # Tile across time: (B, H, S, S) -> (B, H, T*S, T*S)
+        # Each time block gets the same slot-slot bias
+        bias = bias_ss.unsqueeze(2).unsqueeze(4)  # (B, H, 1, S, 1, S)
+        bias = bias.expand(B, self.heads, T, S, T, S)  # (B, H, T, S, T, S)
+        bias = bias.reshape(B, self.heads, T * S, T * S)  # (B, H, T*S, T*S)
+
+        return bias
+
+
+# ---------------------------------------------------------------------------
+# Mechanism-Aware FFN
+# ---------------------------------------------------------------------------
+
+
+class MechanismFFN(nn.Module):
+    """
+    Feed-forward network that incorporates mechanism context.
+
+    Standard FFN takes slot features only:
+        z_next = FFN(z + attn_out)
+
+    We augment the input with the mean mechanism context per slot:
+        z_next = FFN([z + attn_out; mean_j(m_ij)])
+
+    This allows the dynamics to use mechanism information for state updates.
+
+    Args:
+        dim: input dimension (slot dim)
+        hidden_dim: FFN hidden dimension
+        dropout: dropout rate
+    """
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        # Input is dim (slot features) + dim (mean mechanism context)
+        self.net = nn.Sequential(
+            nn.LayerNorm(2 * dim),
+            nn.Linear(2 * dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),  # Output is back to slot dim
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, mech_context: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T*S, D) — slot features after attention
+            mech_context: (B, T*S, D) — mean mechanism context per slot
+
+        Returns:
+            (B, T*S, D) — updated slot features
+        """
+        combined = torch.cat([x, mech_context], dim=-1)  # (B, T*S, 2D)
+        return self.net(combined)
+
+
+# ---------------------------------------------------------------------------
+# Standard FFN (fallback without mechanism)
+# ---------------------------------------------------------------------------
+
+
+class StandardFFN(nn.Module):
+    """Standard feed-forward network (no mechanism context)."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# Mechanism Transformer
+# ---------------------------------------------------------------------------
+
+
+class MechanismTransformer(nn.Module):
+    """
+    Transformer encoder with mechanism-biased attention and mechanism-aware FFN.
+
+    Args:
+        dim: model dimension
+        depth: number of transformer layers
+        heads: number of attention heads
+        dim_head: dimension per head
+        mlp_dim: FFN hidden dimension
+        dropout: dropout rate
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList()
+
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList([
+                    MechanismAttention(dim, heads, dim_head, dropout),
+                    MechanismFFN(dim, mlp_dim, dropout),
+                ])
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        m_ij: torch.Tensor | None = None,
+        num_slots: int | None = None,
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """
+        Args:
+            x: (B, T*S, D) — flattened slot sequence
+            m_ij: (B, S, S, D) — mechanism vectors (None = standard transformer)
+            num_slots: S — needed to compute per-slot mechanism context
+            return_attention: whether to return attention weights
+
+        Returns:
+            output: (B, T*S, D)
+            attn_list: list of (B, T*S, T*S) attention weights per layer (or None)
+        """
+        attn_list = [] if return_attention else None
+
+        for attn_layer, ffn_layer in self.layers:
+            # Mechanism-biased attention
+            attn_out, attn_weights = attn_layer(x, m_ij=m_ij, return_attention=return_attention)
+            x = x + attn_out
+
+            if return_attention and attn_weights is not None:
+                attn_list.append(attn_weights)
+
+            # Mechanism-aware FFN
+            if m_ij is not None and num_slots is not None:
+                mech_context = self._compute_mech_context(m_ij, x.shape[1], num_slots)
+                x = x + ffn_layer(x, mech_context)
+            else:
+                # Fallback: zero mechanism context
+                mech_context = torch.zeros_like(x)
+                x = x + ffn_layer(x, mech_context)
+
+        return self.norm(x), attn_list
+
+    def _compute_mech_context(
+        self, m_ij: torch.Tensor, seq_len: int, num_slots: int
+    ) -> torch.Tensor:
+        """
+        Compute mean mechanism context per slot, tiled across time.
+
+        m_ij: (B, S, S, D) — mean over axis 2 gives per-slot context
+        Returns: (B, T*S, D) — mechanism context for each position in the sequence
+        """
+        B, S, _, D = m_ij.shape
+        T = seq_len // S
+
+        # Mean over interaction partners: (B, S, D)
+        mech_per_slot = m_ij.mean(dim=2)  # (B, S, D)
+
+        # Tile across time: (B, S, D) -> (B, T, S, D) -> (B, T*S, D)
+        mech_tiled = mech_per_slot.unsqueeze(1).expand(B, T, S, D)
+        mech_tiled = mech_tiled.reshape(B, T * S, D)
+
+        return mech_tiled
+
+
+# ---------------------------------------------------------------------------
+# MechSlotPredictor (the full dynamics module)
+# ---------------------------------------------------------------------------
+
+
+class MechSlotPredictor(nn.Module):
+    """
+    Masked Slot Predictor with Mechanism Bias.
+
+    Adapted from C-JEPA's MaskedSlotPredictor. Same masking and positional
+    embedding strategy, but with mechanism-biased attention and mechanism-aware FFN.
+
+    Args:
+        num_slots: K — number of slots per frame
+        slot_dim: D — dimension of each slot
+        history_frames: T_hist — number of input history frames
+        pred_frames: T_pred — number of future frames to predict
+        num_masked_slots: M — number of slots to mask during training
+        seed: random seed for reproducible masking
+        depth: transformer depth
+        heads: number of attention heads
+        dim_head: dimension per head
+        mlp_dim: FFN hidden dimension
+        dropout: dropout rate
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        slot_dim: int = 128,
+        history_frames: int = 3,
+        pred_frames: int = 1,
+        num_masked_slots: int = 2,
+        seed: int = 42,
+        depth: int = 6,
+        heads: int = 8,
+        dim_head: int = 64,
+        mlp_dim: int = 2048,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.history_frames = history_frames
+        self.pred_frames = pred_frames
+        self.total_frames = history_frames + pred_frames
+        self.num_masked_slots = num_masked_slots
+        self.seed = seed
+
+        # Learnable mask token
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, slot_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # Time positional embedding
+        self.time_pos_embed = nn.Parameter(
+            torch.randn(1, self.total_frames, 1, slot_dim)
+        )
+
+        # ID projector (anchor mechanism)
+        self.id_projector = nn.Linear(slot_dim, slot_dim)
+
+        # Mechanism-aware transformer backbone
+        self.transformer = MechanismTransformer(
+            dim=slot_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+        )
+
+        # Output head
+        self.to_out = nn.Linear(slot_dim, slot_dim)
+
+    def get_mask_indices(self, batch_size: int, device: torch.device):
+        """Select slots to mask (deterministic via seed for reproducibility)."""
+        rng = np.random.RandomState(self.seed)
+        masked_indices = rng.choice(self.num_slots, self.num_masked_slots, replace=False)
+
+        is_slot_masked = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
+        is_slot_masked[masked_indices] = True
+
+        return is_slot_masked, torch.from_numpy(masked_indices).to(device)
+
+    def prepare_input(self, x: torch.Tensor):
+        """
+        Construct input sequence with masking.
+
+        Logic (same as C-JEPA):
+        - t=0: ALWAYS visible (identity anchor)
+        - Masked slots: visible at t=0, masked at t=1..T_total
+        - Unmasked slots: visible at t=0..T_hist, masked at future
+
+        Args:
+            x: (B, T_hist, S, D) — ground truth history
+
+        Returns:
+            final_input: (B, T_total, S, D)
+            mask_indices: indices of masked slots
+        """
+        B, T_hist, S, D = x.shape
+        T_total = self.total_frames
+        device = x.device
+
+        # Get mask
+        if self.num_masked_slots > 0:
+            is_slot_masked, masked_indices = self.get_mask_indices(B, device)
+        else:
+            masked_indices = torch.tensor([], dtype=torch.long, device=device)
+
+        # Anchors from t=0
+        anchors = x[:, 0, :, :]
+        anchor_queries = self.id_projector(anchors)
+
+        # Query grid: mask_token + time_pos + anchor_query
+        tokens_grid = self.mask_token.expand(B, T_total, S, D)
+        pos_grid = self.time_pos_embed.expand(B, T_total, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_total, S, D)
+        query_input = tokens_grid + pos_grid + anchor_grid
+
+        final_input = query_input.clone()
+
+        # t=0: always real data for all slots
+        final_input[:, 0, :, :] = x[:, 0, :, :] + self.time_pos_embed[:, 0, :, :]
+
+        # Unmasked slots: real data for t=1..T_hist-1
+        if self.num_masked_slots > 0:
+            unmasked_indices = torch.where(~is_slot_masked)[0]
+        else:
+            unmasked_indices = torch.arange(0, S)
+
+        if len(unmasked_indices) > 0 and T_hist > 1:
+            real_history = x[:, 1:, unmasked_indices, :]
+            history_pos = self.time_pos_embed[:, 1:T_hist, :, :].expand(B, T_hist - 1, S, D)
+            history_pos_unmasked = history_pos[:, :, unmasked_indices, :]
+            final_input[:, 1:T_hist, unmasked_indices, :] = real_history + history_pos_unmasked
+
+        return final_input, masked_indices
+
+    def prepare_input_with_mask(
+        self,
+        x: torch.Tensor,
+        is_slot_masked: torch.Tensor,
+        masked_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Prepare input with a custom mask (for CTT losses / System M).
+
+        Same as prepare_input but with arbitrary mask indices.
+        """
+        B, T_hist, S, D = x.shape
+        T_total = self.total_frames
+        device = x.device
+
+        anchors = x[:, 0, :, :]
+        anchor_queries = self.id_projector(anchors)
+
+        tokens_grid = self.mask_token.expand(B, T_total, S, D)
+        pos_grid = self.time_pos_embed.expand(B, T_total, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_total, S, D)
+        query_input = tokens_grid + pos_grid + anchor_grid
+
+        final_input = query_input.clone()
+        final_input[:, 0, :, :] = x[:, 0, :, :] + self.time_pos_embed[:, 0, :, :]
+
+        unmasked_indices = torch.where(~is_slot_masked)[0]
+        if len(unmasked_indices) > 0 and T_hist > 1:
+            real_history = x[:, 1:, unmasked_indices, :]
+            history_pos = self.time_pos_embed[:, 1:T_hist, :, :].expand(B, T_hist - 1, S, D)
+            history_pos_unmasked = history_pos[:, :, unmasked_indices, :]
+            final_input[:, 1:T_hist, unmasked_indices, :] = real_history + history_pos_unmasked
+
+        return final_input
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        m_ij: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ):
+        """
+        Forward pass with mechanism bias.
+
+        Args:
+            x: (B, T_hist, S, D) — history slots
+            m_ij: (B, S, S, D) — bound mechanism vectors from codebook
+            return_attention: whether to return attention weights
+
+        Returns:
+            pred: (B, T_total, S, D) — predicted slots
+            mask_indices: indices of masked slots
+            attn_list: attention weights (if requested)
+        """
+        B, T_hist, S, D = x.shape
+
+        # Prepare masked input
+        x_input, masked_indices = self.prepare_input(x)
+
+        # Flatten for transformer
+        x_flat = rearrange(x_input, "b t s d -> b (t s) d")
+
+        # Forward through mechanism transformer
+        out_flat, attn_list = self.transformer(
+            x_flat,
+            m_ij=m_ij,
+            num_slots=S,
+            return_attention=return_attention,
+        )
+
+        # Unflatten
+        out = rearrange(out_flat, "b (t s) d -> b t s d", t=self.total_frames, s=S)
+        out = self.to_out(out)
+
+        if return_attention:
+            return out, masked_indices, attn_list
+        return out, masked_indices
+
+    @torch.no_grad()
+    def inference(
+        self,
+        x: torch.Tensor,
+        m_ij: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Inference: predict future frames from fully visible history.
+
+        Args:
+            x: (B, T_hist, S, D) — fully visible history
+            m_ij: (B, S, S, D) — mechanism vectors
+
+        Returns:
+            future_prediction: (B, T_pred, S, D)
+        """
+        B, T_hist, S, D = x.shape
+        T_pred = self.pred_frames
+        T_total = T_hist + T_pred
+
+        inf_time_pos_embed = self.time_pos_embed[:, -T_total:, :, :]
+
+        # Anchor query from t=0
+        anchors = x[:, 0, :, :]
+        anchor_queries = self.id_projector(anchors)
+
+        # History: real data + pos embed
+        input_history = x + inf_time_pos_embed[:, :T_hist, :, :]
+
+        # Future: mask_token + pos_embed + anchor_query
+        tokens_grid = self.mask_token.expand(B, T_pred, S, D)
+        pos_grid = inf_time_pos_embed[:, T_hist:T_total, :, :].expand(B, T_pred, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_pred, S, D)
+        input_future = tokens_grid + pos_grid + anchor_grid
+
+        full_input = torch.cat([input_history, input_future], dim=1)
+
+        # Flatten and forward
+        x_flat = rearrange(full_input, "b t s d -> b (t s) d")
+        out_flat, _ = self.transformer(x_flat, m_ij=m_ij, num_slots=S)
+
+        # Unflatten and extract future
+        out = rearrange(out_flat, "b (t s) d -> b t s d", t=T_total, s=S)
+        out = self.to_out(out)
+        return out[:, T_hist:, :, :]
