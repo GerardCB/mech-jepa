@@ -50,7 +50,7 @@ videosaur:
   SLOT_DIM: 128
 
 # ── Masking ──
-num_masked_slots: 2
+num_masked_slots: 4  # max masked slots per batch (actual count is random 0..N)
 
 # ── Predictor (Transformer) ──
 predictor:
@@ -73,7 +73,7 @@ codebook:
 # ── System M ──
 system_m:
   surprise_threshold: 1.0
-  enabled: false  # enable for System M experiments
+  enabled: true  # enable System M for codebook maintenance
 
 # ── CTT Losses (mechanism-level) ──
 ctt_inv_weight: 0.0
@@ -84,6 +84,8 @@ ctt_start_epoch: 20
 # ── Learning Rates ──
 predictor_lr: 5e-4
 codebook_lr: 1e-3  # slightly higher LR for codebook
+warmup_epochs: 5
+max_grad_norm: 0.05
 
 # ── Rollout ──
 rollout:

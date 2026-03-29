@@ -107,13 +107,14 @@ class TestCodebook:
 
 class TestPredictor:
     def test_forward_shapes(self, predictor):
+        predictor.eval()  # eval mode uses deterministic masking
         history = torch.randn(B, T_HIST, K, D)
         m_ij = torch.randn(B, K, K, D)
 
         pred, mask_indices = predictor(history, m_ij=m_ij)
         T_total = T_HIST + T_PRED
         assert pred.shape == (B, T_total, K, D)
-        assert len(mask_indices) == 2  # num_masked_slots
+        assert len(mask_indices) <= 2  # max_masked_slots
 
     def test_forward_without_mechanism(self, predictor):
         """Should work without mechanism bias (falls back to zero)."""

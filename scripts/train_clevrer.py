@@ -17,6 +17,7 @@ Usage:
         embedding_dir=/path/to/slots.pkl wandb.entity=your-entity
 """
 
+import math
 import os
 import pickle as pkl
 from pathlib import Path
@@ -34,6 +35,7 @@ import wandb as wandb_lib
 
 from mechjepa.model import MechJEPA
 from mechjepa.data.clevrer_slots import ClevrerSlotDataset
+from mechjepa.system_m import compute_surprise_from_prediction
 
 
 # Constants (same as C-JEPA for compatibility)
@@ -330,6 +332,21 @@ def run(cfg):
         {"params": codebook_params, "lr": cfg.codebook_lr},
     ])
 
+    # Cosine LR schedule with linear warmup
+    warmup_epochs = cfg.get("warmup_epochs", 5)
+    total_epochs = cfg.trainer.max_epochs
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return epoch / max(warmup_epochs, 1)
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Gradient clipping (matching C-JEPA)
+    max_grad_norm = cfg.get("max_grad_norm", 0.05)
+
     # Rollout-only mode
     if cfg.rollout.get("rollout_only", False):
         ckpt_path = cfg.rollout.get("rollout_checkpoint")
@@ -363,6 +380,16 @@ def run(cfg):
     global_step = 0
     best_val_loss = float("inf")
 
+    # Mixed precision (AMP)
+    use_amp = (
+        cfg.trainer.get("precision", "32") == "16-mixed"
+        and torch.cuda.is_available()
+    )
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    amp_dtype = torch.float16 if use_amp else torch.float32
+    if is_main(rank):
+        logging.info(f"Mixed precision: {'fp16' if use_amp else 'fp32'}")
+
     for epoch in range(cfg.trainer.max_epochs):
         if train_sampler:
             train_sampler.set_epoch(epoch)
@@ -378,9 +405,14 @@ def run(cfg):
         for batch in pbar:
             optimizer.zero_grad()
 
-            losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch)
-            losses["loss"].backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch)
+
+            scaler.scale(losses["loss"]).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss += losses["loss"].item()
             epoch_future += losses["loss_future"].item()
@@ -418,11 +450,17 @@ def run(cfg):
                 f"diversity={epoch_diversity/max(n_batches,1):.4f}"
             )
 
+        # Step LR scheduler
+        scheduler.step()
+
         # Validation
         val_metrics = validate(raw_model, val_loader, cfg, device, world_size)
 
         if is_main(rank):
-            logging.info(f"Epoch {epoch+1}: val_loss={val_metrics['val/loss']:.4f}")
+            logging.info(
+                f"Epoch {epoch+1}: val_loss={val_metrics['val/loss']:.4f}  "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
+            )
 
             # Codebook diagnostics
             diagnostics = raw_model.get_diagnostics()
@@ -440,6 +478,7 @@ def run(cfg):
                     **diag_log,
                     "epoch": epoch + 1,
                     "train/epoch_loss": avg_loss,
+                    "train/lr": scheduler.get_last_lr()[0],
                 })
 
             # Save checkpoint
@@ -453,11 +492,48 @@ def run(cfg):
                 torch.save(raw_model.state_dict(), best_path)
                 logging.info(f"New best model: val_loss={best_val_loss:.4f}")
 
-        # Codebook maintenance
+        # Codebook maintenance with System M
         maint_interval = cfg.codebook.get("maintenance_every_n_epochs", 5)
-        if (epoch + 1) % maint_interval == 0 and is_main(rank):
+        system_m_enabled = cfg.system_m.get("enabled", False)
+
+        if (epoch + 1) % maint_interval == 0:
             dead = raw_model.codebook.get_dead_entries()
-            logging.info(f"Codebook maintenance: {dead.sum().item()} dead entries")
+            num_dead = dead.sum().item()
+
+            if is_main(rank):
+                logging.info(f"Codebook maintenance: {int(num_dead)} dead entries")
+
+            if num_dead > 0 and system_m_enabled:
+                # Compute surprise on a validation batch for reallocation
+                raw_model.eval()
+                try:
+                    maint_batch = next(iter(val_loader))
+                    maint_embed = maint_batch["embed"].to(device)
+                    maint_history = maint_embed[:, :cfg.dinowm.history_size]
+                    maint_next = maint_embed[:, cfg.dinowm.history_size]
+
+                    with torch.no_grad():
+                        surprise_out = compute_surprise_from_prediction(
+                            predictor=raw_model.predictor,
+                            codebook=raw_model.codebook,
+                            z_history=maint_history,
+                            z_next_actual=maint_next,
+                        )
+
+                    raw_model.codebook.reallocate_dead_entries(
+                        surprise_out["codebook_output"]["e_ij"],
+                        surprise_out["surprise_ij"],
+                    )
+
+                    if is_main(rank):
+                        logging.info(
+                            f"Reallocated dead entries. "
+                            f"Max surprise: {surprise_out['max_surprise'].item():.4f}, "
+                            f"Most surprising pair: {surprise_out['most_surprising_pair']}"
+                        )
+                except StopIteration:
+                    pass
+                raw_model.train()
 
     # Final save
     if is_main(rank):

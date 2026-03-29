@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Slot Transformer Dynamics with Mechanism Bias — MechJEPA's prediction engine.
 
@@ -353,8 +355,11 @@ class MechSlotPredictor(nn.Module):
         self.history_frames = history_frames
         self.pred_frames = pred_frames
         self.total_frames = history_frames + pred_frames
-        self.num_masked_slots = num_masked_slots
+        self.max_masked_slots = num_masked_slots
         self.seed = seed
+
+        # Persistent RNG for eval reproducibility (only used when not training)
+        self._eval_rng = np.random.RandomState(seed)
 
         # Learnable mask token
         self.mask_token = nn.Parameter(torch.zeros(1, 1, slot_dim))
@@ -382,9 +387,24 @@ class MechSlotPredictor(nn.Module):
         self.to_out = nn.Linear(slot_dim, slot_dim)
 
     def get_mask_indices(self, batch_size: int, device: torch.device):
-        """Select slots to mask (deterministic via seed for reproducibility)."""
-        rng = np.random.RandomState(self.seed)
-        masked_indices = rng.choice(self.num_slots, self.num_masked_slots, replace=False)
+        """
+        Select slots to mask.
+
+        During training: randomly vary both *which* and *how many* slots
+        are masked (uniformly from 0 to max_masked_slots), following C-JEPA.
+        During eval: use fixed seed for reproducibility.
+        """
+        if self.training:
+            # Randomly sample the NUMBER of slots to mask (0 to max)
+            num_masked = np.random.randint(0, self.max_masked_slots + 1)
+            if num_masked == 0:
+                is_slot_masked = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
+                return is_slot_masked, torch.tensor([], dtype=torch.long, device=device)
+            masked_indices = np.random.choice(self.num_slots, num_masked, replace=False)
+        else:
+            masked_indices = self._eval_rng.choice(
+                self.num_slots, self.max_masked_slots, replace=False,
+            )
 
         is_slot_masked = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
         is_slot_masked[masked_indices] = True
@@ -412,7 +432,7 @@ class MechSlotPredictor(nn.Module):
         device = x.device
 
         # Get mask
-        if self.num_masked_slots > 0:
+        if self.max_masked_slots > 0:
             is_slot_masked, masked_indices = self.get_mask_indices(B, device)
         else:
             masked_indices = torch.tensor([], dtype=torch.long, device=device)
@@ -433,7 +453,7 @@ class MechSlotPredictor(nn.Module):
         final_input[:, 0, :, :] = x[:, 0, :, :] + self.time_pos_embed[:, 0, :, :]
 
         # Unmasked slots: real data for t=1..T_hist-1
-        if self.num_masked_slots > 0:
+        if self.max_masked_slots > 0:
             unmasked_indices = torch.where(~is_slot_masked)[0]
         else:
             unmasked_indices = torch.arange(0, S)

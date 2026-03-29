@@ -39,11 +39,11 @@ def jepa_prediction_loss(
     pred_history = pred_embedding[:, :history_size, :, :]
     pred_future = pred_embedding[:, history_size : history_size + num_preds, :, :]
 
-    # Masked history loss
-    if len(mask_indices) > 0:
+    # Masked history loss (exclude t=0 where all slots are visible anchors)
+    if len(mask_indices) > 0 and history_size > 1:
         loss_masked_history = F.mse_loss(
-            pred_history[:, :, mask_indices, :],
-            history[:, :, mask_indices, :].detach(),
+            pred_history[:, 1:, mask_indices, :],
+            history[:, 1:, mask_indices, :].detach(),
         )
     else:
         loss_masked_history = torch.tensor(0.0, device=device)
@@ -162,10 +162,18 @@ def mechanism_invariance_loss(
 
     x_masked = predictor.prepare_input_with_mask(history, is_slot_masked, masked_indices)
 
-    # Get mechanism assignment with masked input
-    # Use t=0 slots (anchors are always visible) for mechanism computation
-    z_masked_t0 = x_masked[:, 0, :, :]
-    codebook_out = codebook(z_masked_t0)
+    # Run the masked input through the transformer to get hidden states
+    # where the masking actually has an effect (unlike t=0 where all are visible)
+    from einops import rearrange
+
+    x_flat = rearrange(x_masked, "b t s d -> b (t s) d")
+    out_flat, _ = predictor.transformer(x_flat, m_ij=m_ij, num_slots=S)
+    out = rearrange(out_flat, "b (t s) d -> b t s d", t=predictor.total_frames, s=S)
+
+    # Compute mechanism assignments from the transformer's hidden states
+    # at the last history timestep (where masking is active)
+    z_hidden = out[:, T_hist - 1, :, :]  # (B, S, D)
+    codebook_out = codebook(z_hidden)
     alpha_masked = codebook_out["alpha_ij"]
 
     # For non-neighbor pairs, mechanism assignments should be unchanged
