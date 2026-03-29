@@ -8,27 +8,24 @@ A JEPA-based world model that learns persistent, transferable interaction patter
 2. **Edge Binding** — MLP that matches slot pairs to codebook entries via soft assignment
 3. **Mechanism-Biased Attention** — codebook entries bias the slot transformer's dynamics
 
-## Architecture
+This is still a work in progress.
 
-```
-    Input Slots (K=7, D=128)
-           │
-    ┌──────┴──────┐
-    │  Mechanism   │
-    │  Codebook    │─── Persistent memory (survives across episodes)
-    │  (N=16)      │
-    └──────┬──────┘
-           │ m_ij: bound mechanisms per slot pair
-    ┌──────┴──────┐
-    │    Slot      │
-    │ Transformer  │─── Attention biased by mechanism types
-    │  + mech bias │
-    └──────┬──────┘
-           │
-    Predicted Future Slots
-```
+## Key Idea
 
-The codebook adds **~100K parameters** on top of the slot transformer — negligible overhead for mechanism discovery.
+**Why not just add CTT losses to attention?** We tried — CTT-JEPA enforced causal invariance directly on attention weights, and it *hurt* performance. The reason: attention ≠ causality. A slot can attend to another slot without there being a causal interaction (e.g., background attends to foreground for context), and causal mechanisms might not be represented by any slot.
+
+**MechJEPA's fix:** Give physical mechanisms their own representation (the codebook). Invariance operates at the mechanism level — "collision between ball A and ball B should look the same regardless of which other balls are in the scene" — not at the attention level. The codebook entries learn to serve as the canonical vocabulary for physical interactions.
+
+## Codebook Mechanics
+
+The codebook is the persistent memory that survives across episodes:
+
+- **16 entries** start as random vectors
+- During training, some learn useful patterns (collisions, gravity) and get high usage
+- Others stay "dead" (low EMA usage)
+- When a novel interaction appears (high surprise), the most surprised edge's feature replaces a dead entry
+- Over time, the codebook fills with the actual mechanism vocabulary of the environment
+
 
 ## Results
 
@@ -44,7 +41,7 @@ The codebook adds **~100K parameters** on top of the slot transformer — neglig
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/mechjepa.git
+git clone https://github.com/GerardCB/mechjepa.git
 cd mechjepa
 pip install -e ".[dev]"
 ```
@@ -99,32 +96,6 @@ mechjepa/
     ├── codebook_viz.ipynb    # Codebook differentiation demo
     ├── surprise_demo.ipynb   # System M in action
     └── transfer_demo.ipynb   # Cross-task mechanism transfer
-```
-
-## Key Idea
-
-**Why not just add CTT losses to attention?** We tried — CTT-JEPA enforced causal invariance directly on attention weights, and it *hurt* performance. The reason: attention ≠ causality. A slot can attend to another slot without there being a causal interaction (e.g., background attends to foreground for context).
-
-**MechJEPA's fix:** Give physical mechanisms their own representation (the codebook). Invariance operates at the mechanism level — "collision between ball A and ball B should look the same regardless of which other balls are in the scene" — not at the attention level. The codebook entries learn to be the canonical vocabulary of physical interactions.
-
-## Codebook Mechanics
-
-The codebook is the persistent memory that survives across episodes:
-
-- **16 entries** start as random vectors
-- During training, some learn useful patterns (collisions, gravity) and get high usage
-- Others stay "dead" (low EMA usage)
-- When a novel interaction appears (high surprise), the most surprised edge's feature replaces a dead entry
-- Over time, the codebook fills with the actual mechanism vocabulary of the environment
-
-## Citation
-
-```bibtex
-@article{calvobartra2025mechjepa,
-  title={MechJEPA: World Models with Persistent Mechanism Memory},
-  author={Calvo Bartra, Gerard},
-  year={2025}
-}
 ```
 
 ## License
