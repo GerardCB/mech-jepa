@@ -7,7 +7,7 @@
 set -e
 
 WORKSPACE="/workspace"
-CJEPA="$WORKSPACE/cjepa"
+CJEPA="$WORKSPACE/cjepa/cjepa"
 MECHJEPA="$WORKSPACE/mechjepa"
 LOGS="$WORKSPACE/logs"
 ALOE_OUT="$WORKSPACE/aloe_output"
