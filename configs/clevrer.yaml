@@ -67,7 +67,7 @@ codebook:
   temperature_min: 0.1              # Gumbel-softmax end temp (commitment)
   anneal_epochs: 30                 # linear annealing schedule
   commitment_weight: 0.25
-  sharpness_weight: 0.1             # per-pair entropy minimization
+  sharpness_weight: 0.01            # per-pair entropy minimization (0.1 caused collapse)
   dead_threshold: 0.01
   edge_hidden_dim: 256
   maintenance_every_n_epochs: 5

@@ -164,7 +164,7 @@ def compute_loss(model, batch, cfg, device, epoch=0, max_epochs=100, inference=F
         "history_size": cfg.dinowm.history_size,
         "num_preds": cfg.dinowm.num_preds,
         "commitment_weight": cfg.codebook.commitment_weight,
-        "sharpness_weight": cfg.codebook.get("sharpness_weight", 0.1),
+        "sharpness_weight": cfg.codebook.get("sharpness_weight", 0.01),
         "ctt_inv_weight": cfg.get("ctt_inv_weight", 0.0),
         "ctt_suf_weight": cfg.get("ctt_suf_weight", 0.0),
         "ctt_start_epoch": cfg.get("ctt_start_epoch", 20),
@@ -455,6 +455,17 @@ def run(cfg):
                 f"commit={epoch_commitment/max(n_batches,1):.4f} "
                 f"sharpness={epoch_sharpness/max(n_batches,1):.4f} "
                 f"tau={tau:.3f}"
+            )
+
+            # Codebook usage diagnostic (detect index collapse vs differentiation)
+            usage = raw_model.codebook.codebook_usage
+            usage_norm = usage / (usage.sum() + 1e-8)
+            cb_entropy = -(usage_norm * (usage_norm + 1e-8).log()).sum().item()
+            usage_str = ' '.join(f'{u:.1f}' for u in usage.tolist())
+            logging.info(
+                f"  codebook: entropy={cb_entropy:.3f} "
+                f"max/min={usage.max():.1f}/{usage.min():.1f} "
+                f"usage=[{usage_str}]"
             )
 
         # Step LR scheduler
