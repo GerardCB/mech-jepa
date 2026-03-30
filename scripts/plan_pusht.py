@@ -74,6 +74,7 @@ def run_planning_playback(
     goal_t = min(start_t + history_size + horizon, T - 1)
     
     history = slots[start_t:start_t + history_size].unsqueeze(0) # (1, T_hist, S, D)
+    hist_actions = actions[start_t:start_t + history_size].unsqueeze(0) # (1, T_hist, action_dim)
     goal_slots = slots[goal_t] # (S, D)
     
     planner = CEMPlanner(
@@ -84,7 +85,7 @@ def run_planning_playback(
     )
     
     logging.info(f"Planning from episode {key}, goal at t={goal_t}")
-    planned_actions = planner.plan(history, goal_slots)
+    planned_actions = planner.plan(history, hist_actions, goal_slots)
     
     # Validation metrics
     # Compare with ground truth actions if possible, 
@@ -93,13 +94,15 @@ def run_planning_playback(
     
     with torch.no_grad():
         curr_hist = history
+        curr_acts = hist_actions
         for h in range(planned_actions.shape[1]):
-            # Correct predictor input shape for actions: (B, T_hist, action_dim)
-            step_act = planned_actions[:, h, :].unsqueeze(1) # (1, 1, 2)
-            hist_actions = torch.zeros(1, history_size, 2, device=device)
-            hist_actions[:, -1, :] = step_act.squeeze(1)
+            # Action for current step
+            step_act = planned_actions[:, h:h+1, :] # (1, 1, 2)
             
-            next_pred = model.inference(curr_hist, actions=hist_actions)
+            # Shift action buffer
+            curr_acts = torch.cat([curr_acts[:, 1:, :], step_act], dim=1) # (1, T_hist, 2)
+            
+            next_pred = model.inference(curr_hist, actions=curr_acts)
             curr_hist = torch.cat([curr_hist[:, 1:], next_pred], dim=1)
             
         final_pred = curr_hist[:, -1, :, :]

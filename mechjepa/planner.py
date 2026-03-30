@@ -32,10 +32,11 @@ class CEMPlanner:
         self.alpha = alpha
 
     @torch.no_grad()
-    def plan(self, history: torch.Tensor, goal_slots: torch.Tensor) -> torch.Tensor:
+    def plan(self, history: torch.Tensor, hist_actions: torch.Tensor, goal_slots: torch.Tensor) -> torch.Tensor:
         """
         Args:
             history: (B, T_hist, S, D) — current history of slots
+            hist_actions: (B, T_hist, action_dim) — actions corresponding to the history
             goal_slots: (S, D) or (B, S, D) — target slot configuration
         Returns:
             best_action_sequence: (B, horizon, action_dim)
@@ -63,27 +64,19 @@ class CEMPlanner:
             B_total = B * self.num_samples
             flat_actions = candidate_actions.reshape(B_total, self.horizon, self.action_dim)
             flat_history = history.unsqueeze(1).expand(-1, self.num_samples, -1, -1, -1).reshape(B_total, T_hist, S, D)
+            flat_hist_act = hist_actions.unsqueeze(1).expand(-1, self.num_samples, -1, -1).reshape(B_total, T_hist, self.action_dim)
             
             # Roll out step-by-step
             curr_history = flat_history
+            curr_actions = flat_hist_act
             for h in range(self.horizon):
                 # Predict next frame: (B_total, 1, S, D)
-                # Note: We use the transition's action. In our model, action[t] handles transition (t -> t+1).
-                # Current frame is at index T_hist-1. We need action[T_hist-1] for the rollout.
-                # However, the predictor's forward/inference logic takes actions for the entire history.
-                # During rollout, we append the predicted frame to history and continue.
-                
-                # Taking only the relevant action for the *current* transition
                 step_action = flat_actions[:, h:h+1, :] # (B_total, 1, action_dim)
-                # Construct history actions (padding zeros for previous steps if needed,
-                # but predictor only cares about the last T_hist actions)
-                # Actually, predictor.inference takes history (B, T_hist, S, D) and actions (B, T_hist, D_act).
-                # The action at history[:, -1] is the one that produces the next frame.
                 
-                hist_actions = torch.zeros(B_total, T_hist, self.action_dim, device=self.device)
-                hist_actions[:, -1, :] = step_action.squeeze(1)
+                # Update rolling action buffer
+                curr_actions = torch.cat([curr_actions[:, 1:, :], step_action], dim=1)  # (B_total, T_hist, action_dim)
                 
-                next_pred = self.model.inference(curr_history, actions=hist_actions) # (B_total, 1, S, D)
+                next_pred = self.model.inference(curr_history, actions=curr_actions) # (B_total, 1, S, D)
                 
                 # Update history: drop oldest, append newest
                 curr_history = torch.cat([curr_history[:, 1:], next_pred], dim=1)
