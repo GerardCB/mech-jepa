@@ -70,6 +70,26 @@ def compute_surprise(model: MechJEPA, history: torch.Tensor,
     return F.mse_loss(pred_next, actual_next).item()
 
 
+def differentiable_predict(model: MechJEPA, history: torch.Tensor,
+                           hist_actions: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable version of model.inference() — same logic but no
+    @torch.no_grad() wrapper, so gradients can flow for adaptation.
+
+    Args:
+        history:      (B, T_hist, S, D)
+        hist_actions: (B, T_hist, action_dim)
+
+    Returns:
+        pred_next: (B, S, D) — predicted next frame
+    """
+    z_t = history[:, -1, :, :]
+    codebook_output = model.codebook(z_t)
+    m_ij = codebook_output["m_ij"]
+    pred = model.predictor.inference(history, m_ij=m_ij, actions=hist_actions)
+    return pred.squeeze(1)  # (B, S, D)
+
+
 def adaptation_step(model: MechJEPA, optimizer: torch.optim.Optimizer,
                     history: torch.Tensor, hist_actions: torch.Tensor,
                     actual_next: torch.Tensor, n_steps: int = 3) -> float:
@@ -84,7 +104,7 @@ def adaptation_step(model: MechJEPA, optimizer: torch.optim.Optimizer,
     last_loss = float("nan")
     for _ in range(n_steps):
         optimizer.zero_grad()
-        pred_next = model.inference(history, actions=hist_actions).squeeze(1)
+        pred_next = differentiable_predict(model, history, hist_actions)
         loss = F.mse_loss(pred_next, actual_next)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
@@ -92,6 +112,7 @@ def adaptation_step(model: MechJEPA, optimizer: torch.optim.Optimizer,
         last_loss = loss.item()
     model.eval()
     return last_loss
+
 
 
 def run_episode(
