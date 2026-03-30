@@ -66,6 +66,7 @@ class MechJEPA(nn.Module):
         dropout: float = 0.1,
         seed: int = 42,
         surprise_threshold: float = 1.0,
+        action_dim: int | None = None,
         # Legacy kwargs from VQ config (accepted, ignored)
         **kwargs,
     ):
@@ -76,6 +77,7 @@ class MechJEPA(nn.Module):
         self.num_mechanisms = num_mechanisms
         self.history_frames = history_frames
         self.pred_frames = pred_frames
+        self.action_dim = action_dim
 
         # 1. Mechanism Bottleneck (continuous)
         self.codebook = MechanismCodebook(
@@ -97,6 +99,7 @@ class MechJEPA(nn.Module):
             dim_head=transformer_dim_head,
             mlp_dim=transformer_mlp_dim,
             dropout=dropout,
+            action_dim=action_dim,
         )
 
         # 3. System M (non-parametric)
@@ -107,6 +110,7 @@ class MechJEPA(nn.Module):
     def forward(
         self,
         history: torch.Tensor,
+        actions: torch.Tensor | None = None,
         return_attention: bool = False,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
@@ -115,6 +119,7 @@ class MechJEPA(nn.Module):
 
         Args:
             history: (B, T_hist, S, D) — slot history
+            actions: (B, T_hist, action_dim) — per-transition actions (None = unconditional)
             return_attention: whether to return attention weights
 
         Returns:
@@ -127,14 +132,14 @@ class MechJEPA(nn.Module):
         codebook_output = self.codebook(z_t)
         m_ij = codebook_output["m_ij"]  # (B, S, S, D)
 
-        # Step 2: Run mechanism-gated dynamics
+        # Step 2: Run mechanism-gated dynamics with optional action conditioning
         if return_attention:
             pred_embedding, mask_indices, attn_list = self.predictor(
-                history, m_ij=m_ij, return_attention=True,
+                history, m_ij=m_ij, actions=actions, return_attention=True,
             )
         else:
             pred_embedding, mask_indices = self.predictor(
-                history, m_ij=m_ij,
+                history, m_ij=m_ij, actions=actions,
             )
             attn_list = None
 
@@ -182,12 +187,17 @@ class MechJEPA(nn.Module):
         )
 
     @torch.no_grad()
-    def inference(self, history: torch.Tensor) -> torch.Tensor:
+    def inference(
+        self,
+        history: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Predict future frames from fully visible history.
 
         Args:
             history: (B, T_hist, S, D)
+            actions: (B, T_hist, action_dim) — actions (None = unconditional)
 
         Returns:
             future: (B, T_pred, S, D)
@@ -195,7 +205,7 @@ class MechJEPA(nn.Module):
         z_t = history[:, -1, :, :]
         codebook_output = self.codebook(z_t)
         m_ij = codebook_output["m_ij"]
-        return self.predictor.inference(history, m_ij=m_ij)
+        return self.predictor.inference(history, m_ij=m_ij, actions=actions)
 
     def get_diagnostics(self) -> dict:
         """Return model diagnostics for logging."""

@@ -4,14 +4,20 @@ from __future__ import annotations
 Slot Transformer Dynamics with Mechanism Bias — MechJEPA's prediction engine.
 
 Adapted from ctt-jepa's MaskedSlotPredictor. The key modifications:
-  1. MechanismAttention: custom attention layer that adds mechanism-derived bias
-     to attention logits before softmax
-  2. MechanismFFN: feed-forward network that takes mechanism context as additional input
-  3. Same masking & positional embedding strategy as C-JEPA for compatibility
+  1. MechanismAttention: multiplicative mechanism gating (bottleneck controls
+     which slot pairs interact)
+  2. ActionAdaLN: Adaptive Layer Normalization for action conditioning (actions
+     control global dynamics intensity) — composing with mechanism gating
+  3. MechanismFFN: feed-forward network with mechanism context
+  4. Same masking & positional embedding strategy as C-JEPA for compatibility
 
-The mechanism codebook biases which interactions happen (via attention bias)
-and how information flows (via FFN context), while the original slot transformer
-architecture handles the temporal prediction.
+Composition order per layer:
+  LN → AdaLN modulation (action) → Q,K,V → standard attention
+  → multiplicative mechanism gate (bottleneck) → output
+
+Actions and mechanisms address orthogonal questions:
+  - Actions: global dynamics intensity (hard push vs soft push)
+  - Mechanisms: per-pair interaction topology (which objects affect which)
 """
 
 import torch
@@ -19,6 +25,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Layer Normalization (Action Conditioning)
+# ---------------------------------------------------------------------------
+
+
+class ActionAdaLN(nn.Module):
+    """
+    Adaptive Layer Normalization for action conditioning.
+
+    Given an action embedding, produces (scale, shift) parameters that
+    modulate LayerNorm output: AdaLN(x) = scale * LN(x) + shift.
+
+    This follows LeWorldModel's approach: actions control HOW STRONGLY
+    the dynamics operate at each layer, while the mechanism gate controls
+    WHICH pairs interact.
+
+    Args:
+        dim: feature dimension (slot_dim)
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        # Produces (scale, shift) from action embedding
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 2 * dim),
+        )
+        # Initialize to identity: scale=1, shift=0
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+
+    def forward(
+        self, x_normed: torch.Tensor, action_emb: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Modulate normalized features with action embedding.
+
+        Args:
+            x_normed: (B, N, D) — output of LayerNorm
+            action_emb: (B, N, D) — action embedding (None = identity)
+
+        Returns:
+            (B, N, D) — modulated features
+        """
+        if action_emb is None:
+            return x_normed
+
+        # (B, N, 2D) → split to (B, N, D) each
+        params = self.modulation(action_emb)
+        scale, shift = params.chunk(2, dim=-1)
+        # scale is centered at 0, so add 1 for identity initialization
+        return x_normed * (1 + scale) + shift
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +116,7 @@ class MechanismAttention(nn.Module):
         self.dim_head = dim_head
 
         self.norm = nn.LayerNorm(dim)
+        self.adaln = ActionAdaLN(dim)  # Action modulation after LN
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
         self.attn_dropout = nn.Dropout(dropout)
@@ -74,32 +135,40 @@ class MechanismAttention(nn.Module):
         self,
         x: torch.Tensor,
         m_ij: torch.Tensor | None = None,
+        action_emb: torch.Tensor | None = None,
         return_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
+        Composition order:
+          LN → AdaLN (action intensity) → Q,K,V → attention → mechanism gate (pair topology) → output
+
         Args:
             x: (B, T*S, D) — flattened slot sequence
-            m_ij: (B, S, S, D) — bound mechanism vectors (None = no gating)
+            m_ij: (B, S, S, D) — mechanism vectors (None = no gating)
+            action_emb: (B, T*S, D) — action embedding (None = no modulation)
             return_attention: whether to return attention weights
 
         Returns:
             output: (B, T*S, D)
             attn_weights: (B, T*S, T*S) if return_attention else None
         """
-        x = self.norm(x)
-        B, N, _ = x.shape
+        # Step 1: LayerNorm → AdaLN modulation (action controls dynamics intensity)
+        x_normed = self.norm(x)
+        x_normed = self.adaln(x_normed, action_emb)
 
-        # Standard Q, K, V
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        B, N, _ = x_normed.shape
+
+        # Step 2: Q, K, V from action-modulated features
+        qkv = self.to_qkv(x_normed).chunk(3, dim=-1)
         q, k, v = (rearrange(t, "b n (h d) -> b h n d", h=self.heads) for t in qkv)
 
-        # Standard attention
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
+        # Step 3: Standard attention
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn_logits, dim=-1)
 
-        # Multiplicative mechanism gating
+        # Step 4: Multiplicative mechanism gating (bottleneck controls pair topology)
         if m_ij is not None:
-            mech_gate = self._compute_mech_gate(m_ij, N)  # (B, H, N, N)
+            mech_gate = self._compute_mech_gate(m_ij, N)
             attn = attn * mech_gate
 
         attn = self.attn_dropout(attn)
@@ -109,7 +178,7 @@ class MechanismAttention(nn.Module):
         out = self.to_out(out)
 
         if return_attention:
-            return out, attn.mean(dim=1)  # average over heads
+            return out, attn.mean(dim=1)
         return out, None
 
     def _compute_mech_gate(self, m_ij: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -170,9 +239,10 @@ class MechanismFFN(nn.Module):
 
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
+        self.norm = nn.LayerNorm(2 * dim)
+        self.adaln = ActionAdaLN(2 * dim)  # Action modulation on concatenated input
         # Input is dim (slot features) + dim (mean mechanism context)
         self.net = nn.Sequential(
-            nn.LayerNorm(2 * dim),
             nn.Linear(2 * dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -180,16 +250,27 @@ class MechanismFFN(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, mech_context: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mech_context: torch.Tensor,
+        action_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T*S, D) — slot features after attention
             mech_context: (B, T*S, D) — mean mechanism context per slot
+            action_emb: (B, T*S, D) — action embedding (None = no modulation)
 
         Returns:
             (B, T*S, D) — updated slot features
         """
         combined = torch.cat([x, mech_context], dim=-1)  # (B, T*S, 2D)
+        combined = self.norm(combined)
+        # Expand action_emb to match 2D dimension if provided
+        if action_emb is not None:
+            action_emb_2d = action_emb.repeat(1, 1, 2)  # (B, T*S, 2D)
+            combined = self.adaln(combined, action_emb_2d)
         return self.net(combined)
 
 
@@ -242,10 +323,22 @@ class MechanismTransformer(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
+        action_dim: int | None = None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList()
+        self.action_dim = action_dim
+
+        # Action embedder: raw action → slot_dim embedding
+        if action_dim is not None:
+            self.action_embedder = nn.Sequential(
+                nn.Linear(action_dim, dim // 2),
+                nn.GELU(),
+                nn.Linear(dim // 2, dim),
+            )
+        else:
+            self.action_embedder = None
 
         for _ in range(depth):
             self.layers.append(
@@ -255,11 +348,46 @@ class MechanismTransformer(nn.Module):
                 ])
             )
 
+    def _embed_actions(
+        self, actions: torch.Tensor | None, seq_len: int, num_slots: int
+    ) -> torch.Tensor | None:
+        """
+        Embed actions and expand to match slot sequence shape.
+
+        Args:
+            actions: (B, T, action_dim) — one action per timestep transition
+            seq_len: T*S — total sequence length
+            num_slots: S
+
+        Returns:
+            action_emb: (B, T*S, D) or None
+        """
+        if actions is None or self.action_embedder is None:
+            return None
+
+        B, T_act, _ = actions.shape
+        T = seq_len // num_slots
+
+        # Embed: (B, T_act, action_dim) → (B, T_act, D)
+        act_emb = self.action_embedder(actions)  # (B, T_act, D)
+
+        # Pad if T_act < T (e.g. future frames have no action)
+        if T_act < T:
+            pad = torch.zeros(B, T - T_act, act_emb.shape[-1], device=act_emb.device)
+            act_emb = torch.cat([act_emb, pad], dim=1)  # (B, T, D)
+
+        # Expand across slots: (B, T, D) → (B, T, S, D) → (B, T*S, D)
+        act_emb = act_emb[:, :T].unsqueeze(2).expand(B, T, num_slots, -1)
+        act_emb = act_emb.reshape(B, T * num_slots, -1)
+
+        return act_emb
+
     def forward(
         self,
         x: torch.Tensor,
         m_ij: torch.Tensor | None = None,
         num_slots: int | None = None,
+        actions: torch.Tensor | None = None,
         return_attention: bool = False,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """
@@ -267,6 +395,7 @@ class MechanismTransformer(nn.Module):
             x: (B, T*S, D) — flattened slot sequence
             m_ij: (B, S, S, D) — mechanism vectors (None = standard transformer)
             num_slots: S — needed to compute per-slot mechanism context
+            actions: (B, T, action_dim) — actions per timestep (None = unconditional)
             return_attention: whether to return attention weights
 
         Returns:
@@ -275,22 +404,27 @@ class MechanismTransformer(nn.Module):
         """
         attn_list = [] if return_attention else None
 
+        # Embed actions once, shared across all layers
+        action_emb = self._embed_actions(actions, x.shape[1], num_slots) if num_slots else None
+
         for attn_layer, ffn_layer in self.layers:
-            # Mechanism-biased attention
-            attn_out, attn_weights = attn_layer(x, m_ij=m_ij, return_attention=return_attention)
+            # Mechanism-biased attention with action modulation
+            # Order: LN → AdaLN(action) → QKV → attn → mechanism gate → output
+            attn_out, attn_weights = attn_layer(
+                x, m_ij=m_ij, action_emb=action_emb, return_attention=return_attention
+            )
             x = x + attn_out
 
             if return_attention and attn_weights is not None:
                 attn_list.append(attn_weights)
 
-            # Mechanism-aware FFN
+            # Mechanism-aware FFN with action modulation
             if m_ij is not None and num_slots is not None:
                 mech_context = self._compute_mech_context(m_ij, x.shape[1], num_slots)
-                x = x + ffn_layer(x, mech_context)
+                x = x + ffn_layer(x, mech_context, action_emb=action_emb)
             else:
-                # Fallback: zero mechanism context
                 mech_context = torch.zeros_like(x)
-                x = x + ffn_layer(x, mech_context)
+                x = x + ffn_layer(x, mech_context, action_emb=action_emb)
 
         return self.norm(x), attn_list
 
@@ -355,6 +489,7 @@ class MechSlotPredictor(nn.Module):
         dim_head: int = 64,
         mlp_dim: int = 2048,
         dropout: float = 0.1,
+        action_dim: int | None = None,
     ):
         super().__init__()
         self.num_slots = num_slots
@@ -364,6 +499,7 @@ class MechSlotPredictor(nn.Module):
         self.total_frames = history_frames + pred_frames
         self.max_masked_slots = num_masked_slots
         self.seed = seed
+        self.action_dim = action_dim
 
         # Persistent RNG for eval reproducibility (only used when not training)
         self._eval_rng = np.random.RandomState(seed)
@@ -380,7 +516,7 @@ class MechSlotPredictor(nn.Module):
         # ID projector (anchor mechanism)
         self.id_projector = nn.Linear(slot_dim, slot_dim)
 
-        # Mechanism-aware transformer backbone
+        # Mechanism-aware transformer backbone (with optional action conditioning)
         self.transformer = MechanismTransformer(
             dim=slot_dim,
             depth=depth,
@@ -388,6 +524,7 @@ class MechSlotPredictor(nn.Module):
             dim_head=dim_head,
             mlp_dim=mlp_dim,
             dropout=dropout,
+            action_dim=action_dim,
         )
 
         # Output head
@@ -512,14 +649,16 @@ class MechSlotPredictor(nn.Module):
         self,
         x: torch.Tensor,
         m_ij: torch.Tensor | None = None,
+        actions: torch.Tensor | None = None,
         return_attention: bool = False,
     ):
         """
-        Forward pass with mechanism bias.
+        Forward pass with mechanism bias and optional action conditioning.
 
         Args:
             x: (B, T_hist, S, D) — history slots
             m_ij: (B, S, S, D) — bound mechanism vectors from codebook
+            actions: (B, T_hist, action_dim) — per-transition actions (None = unconditional)
             return_attention: whether to return attention weights
 
         Returns:
@@ -535,11 +674,12 @@ class MechSlotPredictor(nn.Module):
         # Flatten for transformer
         x_flat = rearrange(x_input, "b t s d -> b (t s) d")
 
-        # Forward through mechanism transformer
+        # Forward through mechanism transformer with action conditioning
         out_flat, attn_list = self.transformer(
             x_flat,
             m_ij=m_ij,
             num_slots=S,
+            actions=actions,
             return_attention=return_attention,
         )
 
@@ -556,6 +696,7 @@ class MechSlotPredictor(nn.Module):
         self,
         x: torch.Tensor,
         m_ij: torch.Tensor | None = None,
+        actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Inference: predict future frames from fully visible history.
@@ -563,6 +704,7 @@ class MechSlotPredictor(nn.Module):
         Args:
             x: (B, T_hist, S, D) — fully visible history
             m_ij: (B, S, S, D) — mechanism vectors
+            actions: (B, T_hist, action_dim) — actions (None = unconditional)
 
         Returns:
             future_prediction: (B, T_pred, S, D)
@@ -588,9 +730,11 @@ class MechSlotPredictor(nn.Module):
 
         full_input = torch.cat([input_history, input_future], dim=1)
 
-        # Flatten and forward
+        # Flatten and forward with actions
         x_flat = rearrange(full_input, "b t s d -> b (t s) d")
-        out_flat, _ = self.transformer(x_flat, m_ij=m_ij, num_slots=S)
+        out_flat, _ = self.transformer(
+            x_flat, m_ij=m_ij, num_slots=S, actions=actions
+        )
 
         # Unflatten and extract future
         out = rearrange(out_flat, "b (t s) d -> b t s d", t=T_total, s=S)

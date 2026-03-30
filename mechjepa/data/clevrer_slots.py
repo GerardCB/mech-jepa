@@ -74,41 +74,55 @@ class ClevrerSlotDataset(torch.utils.data.Dataset):
 
 class PushTSlotDataset(torch.utils.data.Dataset):
     """
-    Dataset for pre-extracted slot embeddings from Push-T environment.
+    Dataset for pre-extracted slot embeddings + actions from Push-T.
 
-    Same interface as ClevrerSlotDataset for consistency.
+    Handles action-frameskip alignment: with frameskip=5, each transition
+    between subsampled slot frames spans 5 raw actions. These are averaged
+    into action blocks following LeWorldModel's approach.
+
+    Returns:
+        {"embed": (T, S, D), "actions": (T, action_dim)}
+        where each action[t] is the averaged action for the transition
+        from slot frame t to slot frame t+1.
 
     Args:
-        data: dict mapping episode names to slot tensors
+        slots_data: dict mapping episode names to slot tensors (T_raw, S, D)
+        actions_data: dict mapping episode names to action tensors (T_raw, action_dim)
+                      If None, returns zero actions (for backward compat)
         split: 'train', 'val', or 'test'
         history_size: number of history frames
         num_preds: number of prediction frames
-        frameskip: temporal stride
+        frameskip: temporal stride (actions between frames are averaged)
+        action_dim: dimension of action space (default 2 for Push-T)
     """
 
     def __init__(
         self,
-        data: dict,
-        split: str,
+        slots_data: dict,
+        actions_data: dict | None = None,
+        split: str = "train",
         history_size: int = 3,
         num_preds: int = 1,
-        frameskip: int = 1,
+        frameskip: int = 5,
+        action_dim: int = 2,
     ):
         super().__init__()
-        self.data = data
+        self.slots_data = slots_data
+        self.actions_data = actions_data
         self.split = split
         self.history_size = history_size
         self.num_preds = num_preds
         self.frameskip = frameskip
+        self.action_dim = action_dim
 
         self.num_steps = history_size + num_preds
         self.clip_len = self.frameskip * self.num_steps
 
-        self.episode_keys = list(self.data.keys())
+        self.episode_keys = list(self.slots_data.keys())
         self.samples = []
 
         for key in self.episode_keys:
-            slots = self.data[key]
+            slots = self.slots_data[key]
             num_frames = slots.shape[0]
             num_valid = max(0, num_frames - self.clip_len + 1)
             for start in range(num_valid):
@@ -119,12 +133,42 @@ class PushTSlotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         key, start = self.samples[idx]
-        slots = self.data[key]
+        slots = self.slots_data[key]
 
+        # Extract slot clip with frameskip
         end = start + self.clip_len
-        clip = slots[start:end:self.frameskip]
+        clip = slots[start:end:self.frameskip]  # (num_steps, S, D)
 
         if not isinstance(clip, torch.Tensor):
             clip = torch.tensor(clip, dtype=torch.float32)
 
-        return {"embed": clip}
+        result = {"embed": clip}
+
+        # Extract and aggregate actions
+        if self.actions_data is not None and key in self.actions_data:
+            actions = self.actions_data[key]
+
+            # For each transition between subsampled slot frames,
+            # average the frameskip raw actions in between
+            action_blocks = []
+            for t in range(self.num_steps):
+                raw_start = start + t * self.frameskip
+                raw_end = min(raw_start + self.frameskip, len(actions))
+
+                if raw_start < len(actions):
+                    block = actions[raw_start:raw_end]
+                    if not isinstance(block, torch.Tensor):
+                        block = torch.tensor(block, dtype=torch.float32)
+                    # Average the actions in this block
+                    avg_action = block.mean(dim=0)
+                else:
+                    avg_action = torch.zeros(self.action_dim)
+
+                action_blocks.append(avg_action)
+
+            result["actions"] = torch.stack(action_blocks)  # (num_steps, action_dim)
+        else:
+            # No actions: return zeros
+            result["actions"] = torch.zeros(self.num_steps, self.action_dim)
+
+        return result

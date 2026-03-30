@@ -19,7 +19,7 @@ wandb:
 
 # ── Data ──
 dataset_name: pusht
-embedding_dir: null
+embedding_dir: null  # path to Push-T slot+action pickle
 cache_dir: null
 
 # ── Training ──
@@ -33,7 +33,7 @@ trainer:
 
 batch_size: 128
 num_workers: 8
-frameskip: 1
+frameskip: 5  # Push-T frameskip (matches C-JEPA/LeWorldModel)
 
 # ── Dynamics ──
 dinowm:
@@ -44,8 +44,11 @@ n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size}'}
 
 # ── Slots ──
 videosaur:
-  NUM_SLOTS: 7  # may differ for Push-T
+  NUM_SLOTS: 4    # Push-T uses 4 slots (agent + 3 T-block parts)
   SLOT_DIM: 128
+
+# ── Action Conditioning ──
+action_dim: 2  # Push-T: 2D push vector (dx, dy)
 
 # ── Masking ──
 num_masked_slots: 2
@@ -58,30 +61,22 @@ predictor:
   dim_head: 64
   dropout: 0.1
 
-# ── Codebook ──
+# ── Mechanism Bottleneck ──
 codebook:
-  num_mechanisms: 16
-  temperature: 0.1
-  commitment_weight: 0.25
-  diversity_weight: 0.1
-  dead_threshold: 0.01
+  num_mechanisms: 8    # fewer than CLEVRER (4 slots → 16 pairs, 8 dims enough)
   edge_hidden_dim: 256
-  maintenance_every_n_epochs: 5
+  bottleneck_recon_weight: 0.0
 
 # ── System M ──
 system_m:
   surprise_threshold: 1.0
   enabled: false
 
-# ── CTT ──
-ctt_inv_weight: 0.0
-ctt_suf_weight: 0.0
-ctt_adj_threshold: 0.3
-ctt_start_epoch: 20
-
 # ── Learning Rates ──
 predictor_lr: 5e-4
 codebook_lr: 1e-3
+warmup_epochs: 10
+max_grad_norm: 0.05
 
 # ── Rollout ──
 rollout:
@@ -90,5 +85,6 @@ rollout:
   rollout_only: false
   rollout_checkpoint: null
 
+# ── Checkpointing ──
 output_model_name: mechjepa_pusht
 dump_object: true
