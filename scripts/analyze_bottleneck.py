@@ -166,7 +166,7 @@ def extract_bottleneck_vectors(
 def plot_tsne(h: np.ndarray, labels: np.ndarray, output_path: str):
     """t-SNE visualization of h_ij colored by collision label."""
     print(f"Running t-SNE on {h.shape[0]} points...")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
     h_2d = tsne.fit_transform(h)
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
