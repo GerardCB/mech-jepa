@@ -316,14 +316,16 @@ def run_episode(ep_key, ep_slots, ep_actions, ep_states,
 
         tri_frames.append(stitch(p_e, p_f, p_a))
 
-        env_e.step(); env_f.step(); env_a.step()
+        # Check done BEFORE stepping to avoid gym's autoreset assertion
+        done_e = env_e.terminateds is not None and bool(env_e.terminateds[0])
+        done_f = env_f.terminateds is not None and bool(env_f.terminateds[0])
+        done_a = env_a.terminateds is not None and bool(env_a.terminateds[0])
 
-        done = all([
-            env_e.terminateds is not None and env_e.terminateds[0],
-            env_f.terminateds is not None and env_f.terminateds[0],
-            env_a.terminateds is not None and env_a.terminateds[0],
-        ])
-        if done:
+        if not done_e: env_e.step()
+        if not done_f: env_f.step()
+        if not done_a: env_a.step()
+
+        if done_e and done_f and done_a:
             break
 
     logstr = (f'  Frozen surp={np.mean(frz_cem.surp_log):.4f}'
