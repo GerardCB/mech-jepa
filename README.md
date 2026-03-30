@@ -225,19 +225,6 @@ Initialized to identity (scale=1, shift=0) to ensure backward compatibility with
 
 ---
 
-## 📝 Citation
-
-```bibtex
-@misc{mechjepa2025,
-  title  = {MechJEPA: Mechanism-Aware World Models with Surprise-Triggered Adaptation},
-  author = {Calvo-Bartra, Gerard},
-  year   = {2025},
-  url    = {https://github.com/GerardCB/mech-jepa}
-}
-```
-
----
-
 ## 🔗 Related Work
 
 - [I-JEPA](https://arxiv.org/abs/2301.08243): Image-based JEPA
