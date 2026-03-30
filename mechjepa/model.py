@@ -207,6 +207,44 @@ class MechJEPA(nn.Module):
         m_ij = codebook_output["m_ij"]
         return self.predictor.inference(history, m_ij=m_ij, actions=actions)
 
+    def differentiable_inference(
+        self,
+        history: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Same as inference() but with gradients enabled — for System M adaptation.
+        Replicates predictor.inference() body without its @torch.no_grad() wrapper.
+
+        Returns: (B, T_pred, S, D)
+        """
+        from einops import rearrange
+        z_t = history[:, -1, :, :]
+        codebook_output = self.codebook(z_t)
+        m_ij = codebook_output["m_ij"]
+
+        B, T_hist, S, D = history.shape
+        T_pred = self.predictor.pred_frames
+        T_total = T_hist + T_pred
+
+        inf_pos = self.predictor.time_pos_embed[:, -T_total:, :, :]
+        anchors = history[:, 0, :, :]
+        anchor_queries = self.predictor.id_projector(anchors)
+
+        input_history = history + inf_pos[:, :T_hist, :, :]
+        tokens_grid = self.predictor.mask_token.expand(B, T_pred, S, D)
+        pos_grid = inf_pos[:, T_hist:T_total, :, :].expand(B, T_pred, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_pred, S, D)
+        input_future = tokens_grid + pos_grid + anchor_grid
+
+        full_input = torch.cat([input_history, input_future], dim=1)
+        x_flat = rearrange(full_input, "b t s d -> b (t s) d")
+        out_flat, _ = self.predictor.transformer(
+            x_flat, m_ij=m_ij, num_slots=S, actions=actions
+        )
+        out = rearrange(out_flat, "b (t s) d -> b t s d", t=T_total, s=S)
+        return self.predictor.to_out(out)[:, T_hist:, :, :]
+
     def get_diagnostics(self) -> dict:
         """Return model diagnostics for logging."""
         diagnostics = {}
