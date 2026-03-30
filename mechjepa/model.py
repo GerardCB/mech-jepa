@@ -4,14 +4,14 @@ from __future__ import annotations
 MechJEPA — Full model combining all components.
 
 Architecture:
-  1. MechanismCodebook binds slot pairs to mechanism types
-  2. MechSlotPredictor predicts future states with mechanism-biased attention
-  3. System M monitors surprise and triggers codebook maintenance
-  4. Loss functions combine JEPA prediction + codebook commitment + CTT
+  1. MechanismCodebook: continuous low-rank bottleneck for pairwise edge features
+  2. MechSlotPredictor: predicts future states with mechanism-gated attention
+  3. System M: monitors surprise and triggers maintenance (optional)
+  4. Loss: prediction loss only (structure emerges from the objective)
 
 Usage:
     model = MechJEPA(num_slots=7, slot_dim=128)
-    outputs = model(history_slots)
+    outputs = model(history)
     losses = model.compute_loss(outputs, history, target)
 """
 
@@ -29,22 +29,17 @@ class MechJEPA(nn.Module):
     MechJEPA: World Models with Persistent Mechanism Memory.
 
     Combines:
-    - MechanismCodebook: learns N mechanism prototypes
-    - MechSlotPredictor: slot transformer with mechanism bias
+    - MechanismCodebook: continuous low-rank edge bottleneck
+    - MechSlotPredictor: slot transformer with mechanism-gated attention
     - SystemM: surprise-driven mode switching (non-parametric)
 
     Args:
         num_slots: K — number of object slots per frame
         slot_dim: D — dimension of each slot
-        num_mechanisms: N — number of mechanism types in codebook
+        num_mechanisms: N — bottleneck dimension
         history_frames: T_hist — number of history frames
         pred_frames: T_pred — number of future frames to predict
         num_masked_slots: M — slots to mask during training
-        codebook_temperature: τ_start — Gumbel-softmax initial temperature
-        codebook_temperature_min: τ_end — final temperature after annealing
-        codebook_anneal_epochs: epochs to anneal over
-        commitment_weight: β — codebook commitment loss weight
-        sharpness_weight: per-pair entropy minimization weight
         edge_hidden_dim: hidden dim of edge MLP
         transformer_depth: depth of slot transformer
         transformer_heads: number of attention heads
@@ -63,11 +58,6 @@ class MechJEPA(nn.Module):
         history_frames: int = 3,
         pred_frames: int = 1,
         num_masked_slots: int = 2,
-        codebook_temperature: float = 1.0,
-        codebook_temperature_min: float = 0.1,
-        codebook_anneal_epochs: int = 30,
-        commitment_weight: float = 0.25,
-        sharpness_weight: float = 0.1,
         edge_hidden_dim: int = 256,
         transformer_depth: int = 6,
         transformer_heads: int = 8,
@@ -76,31 +66,25 @@ class MechJEPA(nn.Module):
         dropout: float = 0.1,
         seed: int = 42,
         surprise_threshold: float = 1.0,
+        # Legacy kwargs from VQ config (accepted, ignored)
+        **kwargs,
     ):
         super().__init__()
 
-        # Store config for loss computation
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.num_mechanisms = num_mechanisms
         self.history_frames = history_frames
         self.pred_frames = pred_frames
-        self.commitment_weight = commitment_weight
-        self.sharpness_weight = sharpness_weight
 
-        # 1. Mechanism Codebook
+        # 1. Mechanism Bottleneck (continuous)
         self.codebook = MechanismCodebook(
             num_mechanisms=num_mechanisms,
             slot_dim=slot_dim,
-            temperature=codebook_temperature,
-            temperature_min=codebook_temperature_min,
-            anneal_epochs=codebook_anneal_epochs,
-            commitment_weight=commitment_weight,
-            dead_threshold=0.01,
             edge_hidden_dim=edge_hidden_dim,
         )
 
-        # 2. Mechanism-Biased Slot Predictor
+        # 2. Mechanism-Gated Slot Predictor
         self.predictor = MechSlotPredictor(
             num_slots=num_slots,
             slot_dim=slot_dim,
@@ -115,7 +99,7 @@ class MechJEPA(nn.Module):
             dropout=dropout,
         )
 
-        # 3. System M (non-parametric, not nn.Module)
+        # 3. System M (non-parametric)
         self.system_m = SystemM(
             surprise_threshold=surprise_threshold,
         )
@@ -124,30 +108,23 @@ class MechJEPA(nn.Module):
         self,
         history: torch.Tensor,
         return_attention: bool = False,
-        epoch: int = 0,
-        max_epochs: int = 100,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        Full forward pass: codebook binding → mechanism-gated dynamics → prediction.
+        Full forward pass: bottleneck binding → mechanism-gated dynamics → prediction.
 
         Args:
             history: (B, T_hist, S, D) — slot history
             return_attention: whether to return attention weights
-            epoch: current training epoch (for Gumbel temperature annealing)
-            max_epochs: total training epochs
 
         Returns:
-            dict with:
-                pred_embedding: (B, T_total, S, D)
-                mask_indices: (M,)
-                codebook_output: dict from MechanismCodebook
-                attn_list: attention weights (if requested)
+            dict with pred_embedding, mask_indices, codebook_output, attn_list
         """
         B, T_hist, S, D = history.shape
 
         # Step 1: Compute mechanism bindings using the last history frame
         z_t = history[:, -1, :, :]  # (B, S, D)
-        codebook_output = self.codebook(z_t, epoch=epoch, max_epochs=max_epochs)
+        codebook_output = self.codebook(z_t)
         m_ij = codebook_output["m_ij"]  # (B, S, S, D)
 
         # Step 2: Run mechanism-gated dynamics
@@ -173,18 +150,17 @@ class MechJEPA(nn.Module):
         outputs: dict[str, torch.Tensor],
         history: torch.Tensor,
         target: torch.Tensor,
-        epoch: int = 0,
         cfg: dict | None = None,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        Compute all losses from forward outputs.
+        Compute losses from forward outputs.
 
         Args:
             outputs: dict from forward()
             history: (B, T_hist, S, D)
             target: (B, T_pred, S, D)
-            epoch: current training epoch
-            cfg: config dict with loss weights (uses defaults if None)
+            cfg: config dict with loss weights
 
         Returns:
             dict of all losses
@@ -193,12 +169,7 @@ class MechJEPA(nn.Module):
             cfg = {
                 "history_size": self.history_frames,
                 "num_preds": self.pred_frames,
-                "commitment_weight": self.commitment_weight,
-                "sharpness_weight": self.sharpness_weight,
-                "ctt_inv_weight": 0.0,
-                "ctt_suf_weight": 0.0,
-                "ctt_start_epoch": 20,
-                "ctt_adj_threshold": 0.3,
+                "bottleneck_recon_weight": 0.0,
             }
 
         return compute_all_losses(
@@ -208,9 +179,6 @@ class MechJEPA(nn.Module):
             mask_indices=outputs["mask_indices"],
             codebook_output=outputs["codebook_output"],
             cfg=cfg,
-            predictor=self.predictor,
-            codebook_module=self.codebook,
-            epoch=epoch,
         )
 
     @torch.no_grad()
@@ -229,39 +197,15 @@ class MechJEPA(nn.Module):
         m_ij = codebook_output["m_ij"]
         return self.predictor.inference(history, m_ij=m_ij)
 
-    def maintain_codebook(
-        self,
-        e_ij: torch.Tensor,
-        surprise_ij: torch.Tensor,
-    ):
-        """
-        Run codebook maintenance: reallocate dead entries.
-
-        Args:
-            e_ij: (B, K, K, D) — edge features
-            surprise_ij: (B, K, K) — per-edge surprise
-        """
-        self.codebook.reallocate_dead_entries(e_ij, surprise_ij)
-
     def get_diagnostics(self) -> dict:
-        """
-        Return model diagnostics for logging.
-
-        Returns:
-            dict with codebook stats and System M stats
-        """
+        """Return model diagnostics for logging."""
         diagnostics = {}
         diagnostics.update(self.codebook.get_codebook_stats())
         diagnostics.update(self.system_m.get_stats())
         return diagnostics
 
     def get_parameter_count(self) -> dict[str, int]:
-        """
-        Return parameter counts by component.
-
-        Returns:
-            dict with counts for codebook, predictor, total
-        """
+        """Return parameter counts by component."""
         codebook_params = sum(p.numel() for p in self.codebook.parameters())
         predictor_params = sum(p.numel() for p in self.predictor.parameters())
         total = codebook_params + predictor_params

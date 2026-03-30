@@ -1,7 +1,7 @@
 """
 Unit tests for MechJEPA codebook and model.
 
-Tests shape correctness, gradient flow, and codebook mechanics.
+Tests shape correctness, gradient flow, and mechanism bottleneck.
 Run: cd ~/GitHub/mechjepa && python -m pytest tests/ -v
 """
 
@@ -14,7 +14,7 @@ from mechjepa.model import MechJEPA
 
 
 # ── Constants ──
-B, K, D, N = 4, 7, 128, 16  # batch, slots, dim, mechanisms
+B, K, D, N = 4, 7, 128, 16  # batch, slots, dim, bottleneck_dim
 T_HIST, T_PRED = 3, 1
 
 
@@ -42,7 +42,7 @@ def model():
 
 
 # ===========================================================================
-# Codebook Tests
+# Codebook (Bottleneck) Tests
 # ===========================================================================
 
 
@@ -57,47 +57,28 @@ class TestCodebook:
         result = codebook(z)
 
         assert result["m_ij"].shape == (B, K, K, D)
-        assert result["alpha_ij"].shape == (B, K, K, N)
+        assert result["h_ij"].shape == (B, K, K, N)
         assert result["e_ij"].shape == (B, K, K, D)
-        assert result["logits"].shape == (B, K, K, N)
 
-    def test_alpha_sums_to_one(self, codebook):
+    def test_bottleneck_compresses(self, codebook):
+        """h_ij should live in a lower-dimensional space than e_ij."""
         z = torch.randn(B, K, D)
         result = codebook(z)
-        alpha_sum = result["alpha_ij"].sum(dim=-1)
-        assert torch.allclose(alpha_sum, torch.ones_like(alpha_sum), atol=1e-5)
+        assert result["h_ij"].shape[-1] == N  # 16 << 128
 
-    def test_commitment_loss_finite(self, codebook):
-        z = torch.randn(B, K, D)
-        result = codebook(z)
-        loss = codebook.commitment_loss(result["e_ij"], result["m_ij"])
-        assert loss.isfinite()
-        assert loss.requires_grad
-
-    def test_usage_tracking(self, codebook):
-        codebook.train()
-        z = torch.randn(B, K, D)
-        initial_usage = codebook.codebook_usage.clone()
-        _ = codebook(z)
-        # Usage should have been updated
-        assert codebook.usage_initialized
-
-    def test_dead_entry_detection(self, codebook):
-        codebook.codebook_usage.fill_(0.0)
-        dead = codebook.get_dead_entries()
-        assert dead.all()  # all dead when usage is zero
-
-        codebook.codebook_usage.fill_(1.0)
-        dead = codebook.get_dead_entries()
-        assert not dead.any()  # none dead when usage is high
-
-    def test_gradient_flows_through_codebook(self, codebook):
+    def test_gradient_flows_through_bottleneck(self, codebook):
         z = torch.randn(B, K, D, requires_grad=True)
         result = codebook(z)
         loss = result["m_ij"].sum()
         loss.backward()
         assert z.grad is not None
-        assert codebook.codebook.weight.grad is not None
+        assert codebook.encode.weight.grad is not None
+        assert codebook.decode.weight.grad is not None
+
+    def test_diagnostics(self, codebook):
+        stats = codebook.get_codebook_stats()
+        assert "codebook/dim_importance" in stats
+        assert stats["codebook/dim_importance"].shape == (N,)
 
 
 # ===========================================================================
@@ -107,17 +88,17 @@ class TestCodebook:
 
 class TestPredictor:
     def test_forward_shapes(self, predictor):
-        predictor.eval()  # eval mode uses deterministic masking
+        predictor.eval()
         history = torch.randn(B, T_HIST, K, D)
         m_ij = torch.randn(B, K, K, D)
 
         pred, mask_indices = predictor(history, m_ij=m_ij)
         T_total = T_HIST + T_PRED
         assert pred.shape == (B, T_total, K, D)
-        assert len(mask_indices) <= 2  # max_masked_slots
+        assert len(mask_indices) <= 2
 
     def test_forward_without_mechanism(self, predictor):
-        """Should work without mechanism bias (falls back to zero)."""
+        """Should work without mechanism vectors (falls back to no gating)."""
         history = torch.randn(B, T_HIST, K, D)
         pred, _ = predictor(history, m_ij=None)
         assert pred.shape == (B, T_HIST + T_PRED, K, D)
@@ -162,7 +143,7 @@ class TestMechJEPA:
         outputs = model(history)
 
         assert outputs["pred_embedding"].shape == (B, T_HIST + T_PRED, K, D)
-        assert outputs["codebook_output"]["alpha_ij"].shape == (B, K, K, N)
+        assert outputs["codebook_output"]["h_ij"].shape == (B, K, K, N)
 
     def test_inference_shapes(self, model):
         history = torch.randn(B, T_HIST, K, D)
@@ -181,8 +162,7 @@ class TestMechJEPA:
         assert losses["loss"].requires_grad
 
         # Check individual losses exist
-        for key in ["loss_jepa", "loss_future", "loss_masked_history",
-                     "loss_commitment", "loss_sharpness"]:
+        for key in ["loss_jepa", "loss_future", "loss_masked_history"]:
             assert key in losses, f"Missing loss: {key}"
 
     def test_end_to_end_gradient(self, model):
@@ -206,14 +186,12 @@ class TestMechJEPA:
         assert counts["codebook_overhead"] < counts["total_params"]
 
     def test_diagnostics(self, model):
-        # Run a forward pass to populate codebook usage
         model.train()
         history = torch.randn(B, T_HIST, K, D)
         _ = model(history)
 
         diag = model.get_diagnostics()
-        assert "codebook/num_dead" in diag
-        assert "codebook/entropy" in diag
+        assert "codebook/dim_importance" in diag
 
 
 # ===========================================================================
@@ -237,7 +215,6 @@ class TestIntegration:
         losses["loss"].backward()
         optimizer.step()
 
-        # Should complete without errors
         assert losses["loss"].isfinite()
 
     def test_multiple_training_steps(self, model):

@@ -119,11 +119,6 @@ def build_model(cfg):
         history_frames=cfg.dinowm.history_size,
         pred_frames=cfg.dinowm.num_preds,
         num_masked_slots=cfg.get("num_masked_slots", 2),
-        codebook_temperature=cfg.codebook.temperature,
-        codebook_temperature_min=cfg.codebook.get("temperature_min", 0.1),
-        codebook_anneal_epochs=cfg.codebook.get("anneal_epochs", 30),
-        commitment_weight=cfg.codebook.commitment_weight,
-        sharpness_weight=cfg.codebook.get("sharpness_weight", 0.1),
         edge_hidden_dim=cfg.codebook.edge_hidden_dim,
         transformer_depth=cfg.predictor.depth,
         transformer_heads=cfg.predictor.heads,
@@ -140,8 +135,8 @@ def build_model(cfg):
 # ===========================================================================
 
 
-def compute_loss(model, batch, cfg, device, epoch=0, max_epochs=100, inference=False):
-    """Compute all MechJEPA losses."""
+def compute_loss(model, batch, cfg, device, epoch=0, inference=False):
+    """Compute MechJEPA losses."""
     embed = batch["embed"].to(device)
 
     history = embed[:, :cfg.dinowm.history_size, :, :]
@@ -156,22 +151,17 @@ def compute_loss(model, batch, cfg, device, epoch=0, max_epochs=100, inference=F
             "loss_masked_history": torch.tensor(0.0, device=device),
         }
 
-    # Full forward pass with epoch info for Gumbel annealing
-    outputs = model(history, epoch=epoch, max_epochs=max_epochs)
+    # Full forward pass
+    outputs = model(history)
 
-    # Build loss config
+    # Simple loss config
     loss_cfg = {
         "history_size": cfg.dinowm.history_size,
         "num_preds": cfg.dinowm.num_preds,
-        "commitment_weight": cfg.codebook.commitment_weight,
-        "sharpness_weight": cfg.codebook.get("sharpness_weight", 0.01),
-        "ctt_inv_weight": cfg.get("ctt_inv_weight", 0.0),
-        "ctt_suf_weight": cfg.get("ctt_suf_weight", 0.0),
-        "ctt_start_epoch": cfg.get("ctt_start_epoch", 20),
-        "ctt_adj_threshold": cfg.get("ctt_adj_threshold", 0.3),
+        "bottleneck_recon_weight": cfg.codebook.get("bottleneck_recon_weight", 0.0),
     }
 
-    losses = model.compute_loss(outputs, history, target, epoch=epoch, cfg=loss_cfg)
+    losses = model.compute_loss(outputs, history, target, cfg=loss_cfg)
 
     return losses
 
@@ -399,8 +389,6 @@ def run(cfg):
         model.train()
         epoch_loss = 0.0
         epoch_future = 0.0
-        epoch_commitment = 0.0
-        epoch_sharpness = 0.0
         n_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main(rank))
@@ -408,7 +396,7 @@ def run(cfg):
             optimizer.zero_grad()
 
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch, max_epochs=cfg.trainer.max_epochs)
+                losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch)
 
             scaler.scale(losses["loss"]).backward()
             scaler.unscale_(optimizer)
@@ -418,8 +406,6 @@ def run(cfg):
 
             epoch_loss += losses["loss"].item()
             epoch_future += losses["loss_future"].item()
-            epoch_commitment += losses.get("loss_commitment", torch.tensor(0.0)).item()
-            epoch_sharpness += losses.get("loss_sharpness", torch.tensor(0.0)).item()
             n_batches += 1
             global_step += 1
 
@@ -430,15 +416,10 @@ def run(cfg):
 
             # Step-level logging
             if wandb_logger and global_step % cfg.get("trainer", {}).get("log_every_n_steps", 10) == 0:
-                # Get current Gumbel temperature
-                tau = raw_model.codebook.get_temperature(epoch, cfg.trainer.max_epochs)
                 log = {
                     "train/loss": losses["loss"].item(),
                     "train/loss_future": losses["loss_future"].item(),
                     "train/loss_masked_history": losses["loss_masked_history"].item(),
-                    "train/loss_commitment": losses.get("loss_commitment", torch.tensor(0.0)).item(),
-                    "train/loss_sharpness": losses.get("loss_sharpness", torch.tensor(0.0)).item(),
-                    "train/gumbel_temperature": tau,
                     "train/step": global_step,
                     "train/epoch": epoch,
                 }
@@ -448,25 +429,20 @@ def run(cfg):
         avg_loss = epoch_loss / max(n_batches, 1)
 
         if is_main(rank):
-            tau = raw_model.codebook.get_temperature(epoch, cfg.trainer.max_epochs)
             logging.info(
                 f"Epoch {epoch+1}: loss={avg_loss:.4f} "
-                f"future={epoch_future/max(n_batches,1):.4f} "
-                f"commit={epoch_commitment/max(n_batches,1):.4f} "
-                f"sharpness={epoch_sharpness/max(n_batches,1):.4f} "
-                f"tau={tau:.3f}"
+                f"future={epoch_future/max(n_batches,1):.4f}"
             )
 
-            # Codebook usage diagnostic (detect index collapse vs differentiation)
-            usage = raw_model.codebook.codebook_usage
-            usage_norm = usage / (usage.sum() + 1e-8)
-            cb_entropy = -(usage_norm * (usage_norm + 1e-8).log()).sum().item()
-            usage_str = ' '.join(f'{u:.1f}' for u in usage.tolist())
-            logging.info(
-                f"  codebook: entropy={cb_entropy:.3f} "
-                f"max/min={usage.max():.1f}/{usage.min():.1f} "
-                f"usage=[{usage_str}]"
-            )
+            # Bottleneck diagnostic: encode/decode weight norms show dimension usage
+            diagnostics = raw_model.get_diagnostics()
+            if 'codebook/dim_importance' in diagnostics:
+                dim_imp = diagnostics['codebook/dim_importance']
+                imp_str = ' '.join(f'{v:.3f}' for v in dim_imp.tolist())
+                logging.info(
+                    f"  bottleneck dims: [{imp_str}] "
+                    f"ratio={dim_imp.max()/(dim_imp.min()+1e-8):.1f}x"
+                )
 
         # Step LR scheduler
         scheduler.step()
@@ -510,48 +486,7 @@ def run(cfg):
                 torch.save(raw_model.state_dict(), best_path)
                 logging.info(f"New best model: val_loss={best_val_loss:.4f}")
 
-        # Codebook maintenance with System M
-        maint_interval = cfg.codebook.get("maintenance_every_n_epochs", 5)
-        system_m_enabled = cfg.system_m.get("enabled", False)
-
-        if (epoch + 1) % maint_interval == 0:
-            dead = raw_model.codebook.get_dead_entries()
-            num_dead = dead.sum().item()
-
-            if is_main(rank):
-                logging.info(f"Codebook maintenance: {int(num_dead)} dead entries")
-
-            if num_dead > 0 and system_m_enabled:
-                # Compute surprise on a validation batch for reallocation
-                raw_model.eval()
-                try:
-                    maint_batch = next(iter(val_loader))
-                    maint_embed = maint_batch["embed"].to(device)
-                    maint_history = maint_embed[:, :cfg.dinowm.history_size]
-                    maint_next = maint_embed[:, cfg.dinowm.history_size]
-
-                    with torch.no_grad():
-                        surprise_out = compute_surprise_from_prediction(
-                            predictor=raw_model.predictor,
-                            codebook=raw_model.codebook,
-                            z_history=maint_history,
-                            z_next_actual=maint_next,
-                        )
-
-                    raw_model.codebook.reallocate_dead_entries(
-                        surprise_out["codebook_output"]["e_ij"],
-                        surprise_out["surprise_ij"],
-                    )
-
-                    if is_main(rank):
-                        logging.info(
-                            f"Reallocated dead entries. "
-                            f"Max surprise: {surprise_out['max_surprise'].item():.4f}, "
-                            f"Most surprising pair: {surprise_out['most_surprising_pair']}"
-                        )
-                except StopIteration:
-                    pass
-                raw_model.train()
+        # (No codebook maintenance needed — continuous bottleneck has no dead entries)
 
     # Final save
     if is_main(rank):

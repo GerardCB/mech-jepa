@@ -15,7 +15,7 @@ wandb:
   enable: true
   project: mechjepa
   entity: null  # set via CLI or env var
-  name: mechjepa_clevrer_v1
+  name: mechjepa_clevrer_v3
 
 # ── Data ──
 dataset_name: clevrer
@@ -60,39 +60,31 @@ predictor:
   dim_head: 64
   dropout: 0.1
 
-# ── Mechanism Codebook (OUR CONTRIBUTION) ──
+# ── Mechanism Bottleneck (OUR CONTRIBUTION) ──
+# Continuous low-rank bottleneck: R^D → R^N → R^D
+# No discrete quantization, no auxiliary losses. The multiplicative
+# gate in attention makes the bottleneck load-bearing, and the
+# prediction loss provides the only needed signal.
 codebook:
-  num_mechanisms: 16
-  temperature: 1.0                  # Gumbel-softmax start temp (exploration)
-  temperature_min: 0.1              # Gumbel-softmax end temp (commitment)
-  anneal_epochs: 30                 # linear annealing schedule
-  commitment_weight: 0.25
-  sharpness_weight: 0.01            # per-pair entropy minimization (0.1 caused collapse)
-  dead_threshold: 0.01
-  edge_hidden_dim: 256
-  maintenance_every_n_epochs: 5
+  num_mechanisms: 16              # bottleneck dimension N (N << D=128)
+  edge_hidden_dim: 256            # edge MLP hidden dim
+  bottleneck_recon_weight: 0.0    # optional ||e_ij - m_ij||² (0 = disabled)
 
 # ── System M ──
 system_m:
   surprise_threshold: 1.0
-  enabled: true  # enable System M for codebook maintenance
-
-# ── CTT Losses (mechanism-level) ──
-ctt_inv_weight: 0.0
-ctt_suf_weight: 0.0
-ctt_adj_threshold: 0.3
-ctt_start_epoch: 20
+  enabled: false  # not needed for continuous bottleneck
 
 # ── Learning Rates ──
 predictor_lr: 5e-4
-codebook_lr: 1e-3  # slightly higher LR for codebook
+codebook_lr: 1e-3  # slightly higher LR for bottleneck
 warmup_epochs: 5
 max_grad_norm: 0.05
 
 # ── Rollout ──
 rollout:
   save_rollout: true
-  rollout_batch_size: 64
+  rollout_batch_size: 256
   rollout_only: false
   rollout_checkpoint: null
 
