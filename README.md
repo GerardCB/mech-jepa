@@ -11,13 +11,13 @@ MechJEPA extends [I-JEPA](https://arxiv.org/abs/2301.08243) with:
 
 ## Demo
 
-**Overlay view** — Three trajectories on one canvas: Real block (🔵 blue), Frozen model prediction (🔴 red), A-B-M prediction (🟢 teal). Amber border = System M adapting.
+**3-panel comparison** — Expert actions (left, 🟢 green), Frozen model CEM planner (centre, 🔴 red), A-B-M agent with System M adaptation (right, 🩵 teal). All three run in the real Push-T physics environment from the same starting state. Amber border = System M adaptation step triggered.
 
-![MechJEPA overlay: Real vs Frozen vs A-B-M](assets/gifs/pusht_overlay_ep01.gif)
+![Expert | Frozen | A-B-M](assets/gifs2/pusht_env_compare_ep01.gif)
 
-**Side-by-side** — Frozen model (left) vs A-B-M agent (right), same ground-truth block shown in both.
+**Overlay view** — All three trajectories on one canvas. Filled = Expert (GT), outlines = model predictions.
 
-![MechJEPA comparison: Frozen vs A-B-M](assets/gifs/pusht_compare_ep01.gif)
+![Overlay: Expert vs Frozen vs A-B-M](assets/gifs2/pusht_env_overlay_ep01.gif)
 
 ---
 
