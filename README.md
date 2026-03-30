@@ -11,9 +11,12 @@ MechJEPA extends [I-JEPA](https://arxiv.org/abs/2301.08243) with:
 
 ## Demo
 
-**3-panel comparison** — Expert actions (left, 🟢 green), Frozen model CEM planner (centre, 🔴 red), A-B-M agent with System M adaptation (right, 🩵 teal). All three agents start from the **same initial state** as the original expert recording. Lavender ghost = goal configuration. Amber border = adaptation triggered.
+**Fully closed-loop comparison** — Expert actions (left, 🟢 green), Frozen MechJEPA (centre, 🔴 red), A-B-M MechJEPA with System M (right, 🩵 teal).
 
-![Expert | Frozen | A-B-M](assets/gifs_fixed/pusht_ep01.gif)
+At every step: `env frame → VideoSAUR DINOv2 ViT → slot corrector → 4 slots → CEM planner → action → env`.
+All three agents start from the identical expert-episode initial state. Amber border = System M adaptation triggered.
+
+![Expert | Frozen | A-B-M Closed-Loop](assets/gifs_closedloop/pusht_cl_ep01.gif)
 
 ---
 
