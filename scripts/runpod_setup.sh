@@ -110,13 +110,13 @@ import torch
 from mechjepa.model import MechJEPA
 from mechjepa.codebook import MechanismCodebook
 from mechjepa.dynamics import MechSlotPredictor
-from mechjepa.losses import compute_mechjepa_loss
-from mechjepa.system_m import SystemM, compute_surprise_from_prediction
+from mechjepa.losses import compute_all_losses
+from mechjepa.system_m import SystemM
 print(f'  PyTorch: {torch.__version__}')
 print(f'  CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'  GPU: {torch.cuda.get_device_name(0)}')
-    print(f'  GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+    print(f'  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 print('  MechJEPA imports OK!')
 "
 

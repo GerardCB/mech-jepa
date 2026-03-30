@@ -13,6 +13,7 @@ CHECKPOINTS="$WORKSPACE/checkpoints"
 LOGS="$WORKSPACE/logs"
 
 cd "$MECHJEPA"
+export PYTHONPATH="$MECHJEPA"
 mkdir -p "$CHECKPOINTS" "$LOGS"
 
 # Verify data exists
