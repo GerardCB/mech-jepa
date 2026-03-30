@@ -24,23 +24,23 @@ cache_dir: null
 
 # ── Training ──
 trainer:
-  max_epochs: 100
+  max_epochs: 30
   strategy: ddp
   devices: auto
   accelerator: gpu
   precision: 16-mixed
   log_every_n_steps: 10
 
-batch_size: 256
-num_workers: 10
+batch_size: 2048
+num_workers: 8
 image_size: 224
 patch_size: 16
-frameskip: 5
+frameskip: 2
 
 # ── Dynamics ──
 dinowm:
-  history_size: 3
-  num_preds: 1
+  history_size: 6
+  num_preds: 10
 
 n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size}'}
 
