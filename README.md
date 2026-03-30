@@ -9,7 +9,18 @@ MechJEPA extends [I-JEPA](https://arxiv.org/abs/2301.08243) with:
 
 > *This is the first demonstration of an A-B-M (Anticipate–Behave–Modulate) agent loop on the Push-T environment.*
 
+## Demo
+
+**Overlay view** — Three trajectories on one canvas: Real block (🔵 blue), Frozen model prediction (🔴 red), A-B-M prediction (🟢 teal). Amber border = System M adapting.
+
+![MechJEPA overlay: Real vs Frozen vs A-B-M](assets/gifs/pusht_overlay_ep01.gif)
+
+**Side-by-side** — Frozen model (left) vs A-B-M agent (right), same ground-truth block shown in both.
+
+![MechJEPA comparison: Frozen vs A-B-M](assets/gifs/pusht_compare_ep01.gif)
+
 ---
+
 
 ## 🏆 Results
 
