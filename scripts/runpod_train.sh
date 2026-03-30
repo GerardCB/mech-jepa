@@ -59,9 +59,11 @@ python scripts/train_clevrer.py \
     predictor.dim_head=64 \
     predictor.dropout=0.1 \
     codebook.num_mechanisms=16 \
-    codebook.temperature=0.1 \
+    codebook.temperature=1.0 \
+    codebook.temperature_min=0.1 \
+    codebook.anneal_epochs=30 \
     codebook.commitment_weight=0.25 \
-    codebook.diversity_weight=0.1 \
+    codebook.sharpness_weight=0.1 \
     codebook.edge_hidden_dim=256 \
     codebook.maintenance_every_n_epochs=5 \
     system_m.enabled=true \

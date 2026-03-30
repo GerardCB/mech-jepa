@@ -63,9 +63,11 @@ predictor:
 # ── Mechanism Codebook (OUR CONTRIBUTION) ──
 codebook:
   num_mechanisms: 16
-  temperature: 0.1
+  temperature: 1.0                  # Gumbel-softmax start temp (exploration)
+  temperature_min: 0.1              # Gumbel-softmax end temp (commitment)
+  anneal_epochs: 30                 # linear annealing schedule
   commitment_weight: 0.25
-  diversity_weight: 0.1
+  sharpness_weight: 0.1             # per-pair entropy minimization
   dead_threshold: 0.01
   edge_hidden_dim: 256
   maintenance_every_n_epochs: 5

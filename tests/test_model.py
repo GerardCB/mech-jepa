@@ -182,7 +182,7 @@ class TestMechJEPA:
 
         # Check individual losses exist
         for key in ["loss_jepa", "loss_future", "loss_masked_history",
-                     "loss_commitment", "loss_diversity"]:
+                     "loss_commitment", "loss_sharpness"]:
             assert key in losses, f"Missing loss: {key}"
 
     def test_end_to_end_gradient(self, model):

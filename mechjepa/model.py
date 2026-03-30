@@ -40,9 +40,11 @@ class MechJEPA(nn.Module):
         history_frames: T_hist — number of history frames
         pred_frames: T_pred — number of future frames to predict
         num_masked_slots: M — slots to mask during training
-        codebook_temperature: τ — binding sharpness
+        codebook_temperature: τ_start — Gumbel-softmax initial temperature
+        codebook_temperature_min: τ_end — final temperature after annealing
+        codebook_anneal_epochs: epochs to anneal over
         commitment_weight: β — codebook commitment loss weight
-        diversity_weight: codebook diversity (entropy) loss weight
+        sharpness_weight: per-pair entropy minimization weight
         edge_hidden_dim: hidden dim of edge MLP
         transformer_depth: depth of slot transformer
         transformer_heads: number of attention heads
@@ -61,9 +63,11 @@ class MechJEPA(nn.Module):
         history_frames: int = 3,
         pred_frames: int = 1,
         num_masked_slots: int = 2,
-        codebook_temperature: float = 0.1,
+        codebook_temperature: float = 1.0,
+        codebook_temperature_min: float = 0.1,
+        codebook_anneal_epochs: int = 30,
         commitment_weight: float = 0.25,
-        diversity_weight: float = 0.1,
+        sharpness_weight: float = 0.1,
         edge_hidden_dim: int = 256,
         transformer_depth: int = 6,
         transformer_heads: int = 8,
@@ -82,13 +86,15 @@ class MechJEPA(nn.Module):
         self.history_frames = history_frames
         self.pred_frames = pred_frames
         self.commitment_weight = commitment_weight
-        self.diversity_weight = diversity_weight
+        self.sharpness_weight = sharpness_weight
 
         # 1. Mechanism Codebook
         self.codebook = MechanismCodebook(
             num_mechanisms=num_mechanisms,
             slot_dim=slot_dim,
             temperature=codebook_temperature,
+            temperature_min=codebook_temperature_min,
+            anneal_epochs=codebook_anneal_epochs,
             commitment_weight=commitment_weight,
             dead_threshold=0.01,
             edge_hidden_dim=edge_hidden_dim,
@@ -118,13 +124,17 @@ class MechJEPA(nn.Module):
         self,
         history: torch.Tensor,
         return_attention: bool = False,
+        epoch: int = 0,
+        max_epochs: int = 100,
     ) -> dict[str, torch.Tensor]:
         """
-        Full forward pass: codebook binding → mechanism-biased dynamics → prediction.
+        Full forward pass: codebook binding → mechanism-gated dynamics → prediction.
 
         Args:
             history: (B, T_hist, S, D) — slot history
             return_attention: whether to return attention weights
+            epoch: current training epoch (for Gumbel temperature annealing)
+            max_epochs: total training epochs
 
         Returns:
             dict with:
@@ -137,10 +147,10 @@ class MechJEPA(nn.Module):
 
         # Step 1: Compute mechanism bindings using the last history frame
         z_t = history[:, -1, :, :]  # (B, S, D)
-        codebook_output = self.codebook(z_t)
+        codebook_output = self.codebook(z_t, epoch=epoch, max_epochs=max_epochs)
         m_ij = codebook_output["m_ij"]  # (B, S, S, D)
 
-        # Step 2: Run mechanism-biased dynamics
+        # Step 2: Run mechanism-gated dynamics
         if return_attention:
             pred_embedding, mask_indices, attn_list = self.predictor(
                 history, m_ij=m_ij, return_attention=True,
@@ -184,7 +194,7 @@ class MechJEPA(nn.Module):
                 "history_size": self.history_frames,
                 "num_preds": self.pred_frames,
                 "commitment_weight": self.commitment_weight,
-                "diversity_weight": self.diversity_weight,
+                "sharpness_weight": self.sharpness_weight,
                 "ctt_inv_weight": 0.0,
                 "ctt_suf_weight": 0.0,
                 "ctt_start_epoch": 20,

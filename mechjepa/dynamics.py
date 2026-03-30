@@ -28,14 +28,18 @@ import numpy as np
 
 class MechanismAttention(nn.Module):
     """
-    Multi-head self-attention with mechanism bias.
+    Multi-head self-attention with multiplicative mechanism gating.
 
     Standard attention computes: attn = softmax(Q @ K^T / sqrt(d))
-    We ADD a mechanism-derived bias:
-        attn = softmax(Q @ K^T / sqrt(d) + bias_proj(m_ij))
+    We GATE the attention with mechanism-derived gates:
+        standard_attn = softmax(Q @ K^T / sqrt(d))
+        mech_gate = sigmoid(gate_proj(m_ij))  # 0-1 per head per pair
+        attn = standard_attn * mech_gate
 
-    This biases the model to route information through mechanism-appropriate
-    pathways without overriding the learned attention patterns.
+    When mech_gate ≈ 0 for a pair, no information flows between those
+    slots regardless of how high the standard attention is. This makes
+    the codebook LOAD-BEARING — the model must learn meaningful mechanism
+    assignments to route information correctly.
 
     Args:
         dim: model dimension
@@ -56,12 +60,15 @@ class MechanismAttention(nn.Module):
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
         self.attn_dropout = nn.Dropout(dropout)
 
-        # Mechanism bias projection: (D) -> (heads) per slot pair
-        self.bias_proj = nn.Sequential(
+        # Mechanism gate projection: (D) -> (heads) per slot pair
+        # Initialized with positive bias so gates start open (~sigmoid(2)≈0.88)
+        self.gate_proj = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.GELU(),
             nn.Linear(dim // 2, heads),
         )
+        # Initialize final layer bias to +2.0 so gates start open
+        nn.init.constant_(self.gate_proj[-1].bias, 2.0)
 
     def forward(
         self,
@@ -72,7 +79,7 @@ class MechanismAttention(nn.Module):
         """
         Args:
             x: (B, T*S, D) — flattened slot sequence
-            m_ij: (B, S, S, D) — bound mechanism vectors (None = no bias)
+            m_ij: (B, S, S, D) — bound mechanism vectors (None = no gating)
             return_attention: whether to return attention weights
 
         Returns:
@@ -86,15 +93,15 @@ class MechanismAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = (rearrange(t, "b n (h d) -> b h n d", h=self.heads) for t in qkv)
 
-        # Attention logits
+        # Standard attention
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
-
-        # Add mechanism bias if available
-        if m_ij is not None:
-            mech_bias = self._compute_mech_bias(m_ij, N)  # (B, H, N, N)
-            attn_logits = attn_logits + mech_bias
-
         attn = F.softmax(attn_logits, dim=-1)
+
+        # Multiplicative mechanism gating
+        if m_ij is not None:
+            mech_gate = self._compute_mech_gate(m_ij, N)  # (B, H, N, N)
+            attn = attn * mech_gate
+
         attn = self.attn_dropout(attn)
 
         out = torch.matmul(attn, v)
@@ -105,14 +112,14 @@ class MechanismAttention(nn.Module):
             return out, attn.mean(dim=1)  # average over heads
         return out, None
 
-    def _compute_mech_bias(self, m_ij: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def _compute_mech_gate(self, m_ij: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Compute mechanism-derived attention bias.
+        Compute multiplicative mechanism gate.
 
         m_ij is (B, S, S, D) — slot-to-slot mechanism vectors.
-        We need to expand this to (B, H, T*S, T*S) for the full sequence.
+        We produce a (B, H, T*S, T*S) gate in [0, 1] via sigmoid.
 
-        The bias is shared across all time steps: the mechanism between
+        The gate is shared across all time steps: the mechanism between
         slot i and slot j is the same regardless of which timestep they're in.
 
         Args:
@@ -120,22 +127,22 @@ class MechanismAttention(nn.Module):
             seq_len: T*S — total sequence length
 
         Returns:
-            bias: (B, H, T*S, T*S)
+            gate: (B, H, T*S, T*S) in [0, 1]
         """
         B, S, _, D = m_ij.shape
         T = seq_len // S
 
-        # Project mechanism vectors to per-head biases: (B, S, S, H)
-        bias_ss = self.bias_proj(m_ij)  # (B, S, S, H)
-        bias_ss = bias_ss.permute(0, 3, 1, 2)  # (B, H, S, S)
+        # Project mechanism vectors to per-head gate logits: (B, S, S, H)
+        gate_ss = self.gate_proj(m_ij)  # (B, S, S, H)
+        gate_ss = torch.sigmoid(gate_ss)  # [0, 1]
+        gate_ss = gate_ss.permute(0, 3, 1, 2)  # (B, H, S, S)
 
         # Tile across time: (B, H, S, S) -> (B, H, T*S, T*S)
-        # Each time block gets the same slot-slot bias
-        bias = bias_ss.unsqueeze(2).unsqueeze(4)  # (B, H, 1, S, 1, S)
-        bias = bias.expand(B, self.heads, T, S, T, S)  # (B, H, T, S, T, S)
-        bias = bias.reshape(B, self.heads, T * S, T * S)  # (B, H, T*S, T*S)
+        gate = gate_ss.unsqueeze(2).unsqueeze(4)  # (B, H, 1, S, 1, S)
+        gate = gate.expand(B, self.heads, T, S, T, S)  # (B, H, T, S, T, S)
+        gate = gate.reshape(B, self.heads, T * S, T * S)  # (B, H, T*S, T*S)
 
-        return bias
+        return gate
 
 
 # ---------------------------------------------------------------------------

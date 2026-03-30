@@ -4,10 +4,12 @@ Mechanism Codebook — the persistent memory of MechJEPA.
 This module implements:
   - MechanismCodebook: nn.Embedding(N, D) storing N mechanism prototypes
   - EdgeMLP: computes pairwise edge features from slot pairs
-  - Soft binding: matches edge features to codebook entries via temperature-scaled dot product
+  - Gumbel-softmax binding: matches edge features to codebook entries
+    with temperature annealing (exploration → commitment)
+  - Per-pair sharpness loss: encourages each pair to commit to 1-2 mechanisms
   - EMA usage tracking + dead entry reallocation
 
-The codebook is the key architectural innovation. Each row captures
+The codebook is a structural bottleneck. Each row captures
 "one way objects can influence each other." The model discovers these
 patterns (collisions, gravity, free-flight) without supervision.
 """
@@ -22,12 +24,14 @@ class MechanismCodebook(nn.Module):
     Persistent mechanism memory with edge binding.
 
     Given K slots of dimension D, computes pairwise edge features and
-    soft-assigns each pair to one of N mechanism prototypes.
+    assigns each pair to one of N mechanism prototypes via Gumbel-softmax.
 
     Args:
         num_mechanisms: N — number of mechanism types in the codebook
         slot_dim: D — dimension of each slot / mechanism vector
-        temperature: τ — softmax temperature for binding sharpness
+        temperature: τ_start — initial Gumbel-softmax temperature
+        temperature_min: τ_end — final temperature after annealing
+        anneal_epochs: how many epochs to anneal over
         commitment_weight: β — weight for commitment loss (VQ-VAE style)
         dead_threshold: minimum EMA usage below which an entry is "dead"
         edge_hidden_dim: hidden dimension of the edge MLP
@@ -37,7 +41,9 @@ class MechanismCodebook(nn.Module):
         self,
         num_mechanisms: int = 16,
         slot_dim: int = 128,
-        temperature: float = 0.1,
+        temperature: float = 1.0,
+        temperature_min: float = 0.1,
+        anneal_epochs: int = 30,
         commitment_weight: float = 0.25,
         dead_threshold: float = 0.01,
         edge_hidden_dim: int = 256,
@@ -45,7 +51,9 @@ class MechanismCodebook(nn.Module):
         super().__init__()
         self.num_mechanisms = num_mechanisms
         self.slot_dim = slot_dim
-        self.temperature = temperature
+        self.temperature_start = temperature
+        self.temperature_min = temperature_min
+        self.anneal_epochs = anneal_epochs
         self.commitment_weight = commitment_weight
         self.dead_threshold = dead_threshold
 
@@ -63,6 +71,16 @@ class MechanismCodebook(nn.Module):
         # EMA usage tracker (not a parameter, survives across episodes)
         self.register_buffer("codebook_usage", torch.zeros(num_mechanisms))
         self.register_buffer("usage_initialized", torch.tensor(False))
+
+    def get_temperature(self, epoch: int = 0, max_epochs: int = 100) -> float:
+        """
+        Compute current Gumbel-softmax temperature with linear annealing.
+
+        Starts at τ_start, linearly anneals to τ_min over anneal_epochs.
+        """
+        anneal_frac = min(1.0, epoch / max(self.anneal_epochs, 1))
+        tau = self.temperature_start - anneal_frac * (self.temperature_start - self.temperature_min)
+        return max(tau, self.temperature_min)
 
     def compute_edges(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -87,13 +105,18 @@ class MechanismCodebook(nn.Module):
         return e_ij
 
     def bind(
-        self, e_ij: torch.Tensor
+        self, e_ij: torch.Tensor, epoch: int = 0, max_epochs: int = 100
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Soft-assign edge features to codebook entries.
+        Bind edge features to codebook entries via Gumbel-softmax.
+
+        During training: Gumbel-softmax with temperature annealing.
+        During eval: standard softmax with low temperature.
 
         Args:
             e_ij: (B, K, K, D) — edge features
+            epoch: current training epoch (for temperature annealing)
+            max_epochs: total epochs (for annealing schedule)
 
         Returns:
             m_ij: (B, K, K, D) — bound mechanism vectors
@@ -101,12 +124,15 @@ class MechanismCodebook(nn.Module):
             logits: (B, K, K, N) — raw logits before softmax
         """
         # Dot-product similarity with codebook: (B, K, K, D) @ (D, N)
-        logits = (
-            e_ij @ self.codebook.weight.T / self.temperature
-        )  # (B, K, K, N)
+        logits = e_ij @ self.codebook.weight.T  # (B, K, K, N) — NO temperature scaling on logits
 
-        # Soft assignment
-        alpha_ij = F.softmax(logits, dim=-1)  # (B, K, K, N)
+        if self.training:
+            # Gumbel-softmax: exploration → commitment
+            tau = self.get_temperature(epoch, max_epochs)
+            alpha_ij = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)  # (B, K, K, N)
+        else:
+            # Eval: sharp softmax
+            alpha_ij = F.softmax(logits / self.temperature_min, dim=-1)  # (B, K, K, N)
 
         # Weighted sum of codebook entries
         m_ij = alpha_ij @ self.codebook.weight  # (B, K, K, D)
@@ -114,13 +140,15 @@ class MechanismCodebook(nn.Module):
         return m_ij, alpha_ij, logits
 
     def forward(
-        self, z: torch.Tensor
+        self, z: torch.Tensor, epoch: int = 0, max_epochs: int = 100
     ) -> dict[str, torch.Tensor]:
         """
         Full forward: compute edges, bind to codebook.
 
         Args:
             z: (B, K, D) — slot vectors
+            epoch: current epoch (for Gumbel temperature annealing)
+            max_epochs: total epochs
 
         Returns:
             dict with keys:
@@ -130,7 +158,7 @@ class MechanismCodebook(nn.Module):
                 logits: (B, K, K, N) — binding logits
         """
         e_ij = self.compute_edges(z)
-        m_ij, alpha_ij, logits = self.bind(e_ij)
+        m_ij, alpha_ij, logits = self.bind(e_ij, epoch=epoch, max_epochs=max_epochs)
 
         # Update usage tracker (no grad)
         if self.training:

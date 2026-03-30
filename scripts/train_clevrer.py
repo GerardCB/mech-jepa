@@ -120,8 +120,10 @@ def build_model(cfg):
         pred_frames=cfg.dinowm.num_preds,
         num_masked_slots=cfg.get("num_masked_slots", 2),
         codebook_temperature=cfg.codebook.temperature,
+        codebook_temperature_min=cfg.codebook.get("temperature_min", 0.1),
+        codebook_anneal_epochs=cfg.codebook.get("anneal_epochs", 30),
         commitment_weight=cfg.codebook.commitment_weight,
-        diversity_weight=cfg.codebook.diversity_weight,
+        sharpness_weight=cfg.codebook.get("sharpness_weight", 0.1),
         edge_hidden_dim=cfg.codebook.edge_hidden_dim,
         transformer_depth=cfg.predictor.depth,
         transformer_heads=cfg.predictor.heads,
@@ -138,7 +140,7 @@ def build_model(cfg):
 # ===========================================================================
 
 
-def compute_loss(model, batch, cfg, device, epoch=0, inference=False):
+def compute_loss(model, batch, cfg, device, epoch=0, max_epochs=100, inference=False):
     """Compute all MechJEPA losses."""
     embed = batch["embed"].to(device)
 
@@ -154,15 +156,15 @@ def compute_loss(model, batch, cfg, device, epoch=0, inference=False):
             "loss_masked_history": torch.tensor(0.0, device=device),
         }
 
-    # Full forward pass
-    outputs = model(history)
+    # Full forward pass with epoch info for Gumbel annealing
+    outputs = model(history, epoch=epoch, max_epochs=max_epochs)
 
     # Build loss config
     loss_cfg = {
         "history_size": cfg.dinowm.history_size,
         "num_preds": cfg.dinowm.num_preds,
         "commitment_weight": cfg.codebook.commitment_weight,
-        "diversity_weight": cfg.codebook.diversity_weight,
+        "sharpness_weight": cfg.codebook.get("sharpness_weight", 0.1),
         "ctt_inv_weight": cfg.get("ctt_inv_weight", 0.0),
         "ctt_suf_weight": cfg.get("ctt_suf_weight", 0.0),
         "ctt_start_epoch": cfg.get("ctt_start_epoch", 20),
@@ -398,7 +400,7 @@ def run(cfg):
         epoch_loss = 0.0
         epoch_future = 0.0
         epoch_commitment = 0.0
-        epoch_diversity = 0.0
+        epoch_sharpness = 0.0
         n_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main(rank))
@@ -406,7 +408,7 @@ def run(cfg):
             optimizer.zero_grad()
 
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch)
+                losses = compute_loss(raw_model, batch, cfg, device, epoch=epoch, max_epochs=cfg.trainer.max_epochs)
 
             scaler.scale(losses["loss"]).backward()
             scaler.unscale_(optimizer)
@@ -417,7 +419,7 @@ def run(cfg):
             epoch_loss += losses["loss"].item()
             epoch_future += losses["loss_future"].item()
             epoch_commitment += losses.get("loss_commitment", torch.tensor(0.0)).item()
-            epoch_diversity += losses.get("loss_diversity", torch.tensor(0.0)).item()
+            epoch_sharpness += losses.get("loss_sharpness", torch.tensor(0.0)).item()
             n_batches += 1
             global_step += 1
 
@@ -428,12 +430,15 @@ def run(cfg):
 
             # Step-level logging
             if wandb_logger and global_step % cfg.get("trainer", {}).get("log_every_n_steps", 10) == 0:
+                # Get current Gumbel temperature
+                tau = raw_model.codebook.get_temperature(epoch, cfg.trainer.max_epochs)
                 log = {
                     "train/loss": losses["loss"].item(),
                     "train/loss_future": losses["loss_future"].item(),
                     "train/loss_masked_history": losses["loss_masked_history"].item(),
                     "train/loss_commitment": losses.get("loss_commitment", torch.tensor(0.0)).item(),
-                    "train/loss_diversity": losses.get("loss_diversity", torch.tensor(0.0)).item(),
+                    "train/loss_sharpness": losses.get("loss_sharpness", torch.tensor(0.0)).item(),
+                    "train/gumbel_temperature": tau,
                     "train/step": global_step,
                     "train/epoch": epoch,
                 }
@@ -443,11 +448,13 @@ def run(cfg):
         avg_loss = epoch_loss / max(n_batches, 1)
 
         if is_main(rank):
+            tau = raw_model.codebook.get_temperature(epoch, cfg.trainer.max_epochs)
             logging.info(
                 f"Epoch {epoch+1}: loss={avg_loss:.4f} "
                 f"future={epoch_future/max(n_batches,1):.4f} "
                 f"commit={epoch_commitment/max(n_batches,1):.4f} "
-                f"diversity={epoch_diversity/max(n_batches,1):.4f}"
+                f"sharpness={epoch_sharpness/max(n_batches,1):.4f} "
+                f"tau={tau:.3f}"
             )
 
         # Step LR scheduler

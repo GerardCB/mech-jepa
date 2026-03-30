@@ -80,29 +80,31 @@ def codebook_commitment_loss(
     return commitment_weight * F.mse_loss(e_ij, m_ij.detach())
 
 
-def codebook_diversity_loss(
+def codebook_sharpness_loss(
     alpha_ij: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Encourage diverse codebook usage by maximizing the entropy of
-    the average assignment distribution.
+    Encourage each slot pair to commit to one or two mechanisms
+    by minimizing per-pair entropy.
 
-    L = -H(mean(alpha_ij))  (negative entropy = we minimize to maximize entropy)
+    L = mean over all pairs of H(alpha_ij[b, i, j, :])
+
+    This is the OPPOSITE of the old diversity loss. Instead of forcing
+    uniform usage (which made the codebook decorative), we force each
+    individual pair to sharpen its assignment. Across the dataset,
+    different pairs will naturally sharpen toward different entries,
+    creating real mechanism differentiation.
 
     Args:
         alpha_ij: (B, K, K, N) — soft mechanism assignments
 
     Returns:
-        Scalar loss (negative entropy, so minimizing this maximizes diversity)
+        Scalar loss (mean per-pair entropy — lower = sharper assignments)
     """
-    # Average assignment across all pairs and batch
-    avg_assignment = alpha_ij.mean(dim=(0, 1, 2))  # (N,)
-    avg_assignment = avg_assignment / (avg_assignment.sum() + eps)
-
-    # Negative entropy
-    entropy = -(avg_assignment * (avg_assignment + eps).log()).sum()
-    return -entropy  # Minimize negative entropy = maximize entropy
+    # Per-pair entropy: H(alpha_ij[b, i, j, :]) for each pair
+    per_pair_entropy = -(alpha_ij * (alpha_ij + eps).log()).sum(dim=-1)  # (B, K, K)
+    return per_pair_entropy.mean()
 
 
 def mechanism_invariance_loss(
@@ -323,14 +325,14 @@ def compute_all_losses(
     else:
         losses["loss_commitment"] = torch.tensor(0.0, device=device)
 
-    # 3. Diversity loss (entropy regularization)
-    diversity_weight = cfg.get("diversity_weight", 0.1)
-    if diversity_weight > 0:
-        loss_diversity = codebook_diversity_loss(codebook_output["alpha_ij"])
-        losses["loss_diversity"] = loss_diversity
-        total_loss = total_loss + diversity_weight * loss_diversity
+    # 3. Sharpness loss (per-pair entropy minimization)
+    sharpness_weight = cfg.get("sharpness_weight", 0.1)
+    if sharpness_weight > 0:
+        loss_sharpness = codebook_sharpness_loss(codebook_output["alpha_ij"])
+        losses["loss_sharpness"] = loss_sharpness
+        total_loss = total_loss + sharpness_weight * loss_sharpness
     else:
-        losses["loss_diversity"] = torch.tensor(0.0, device=device)
+        losses["loss_sharpness"] = torch.tensor(0.0, device=device)
 
     # 4. Mechanism-level CTT losses (optional, phased)
     ctt_start_epoch = cfg.get("ctt_start_epoch", 20)
