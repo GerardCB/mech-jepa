@@ -1,36 +1,30 @@
 """
-render_env_gif.py — Physically correct Push-T GIFs from real environment state.
+render_env_gif.py — Physically-correct Push-T GIFs. Fixed version.
 
-Strategy:
-  1. Replay stored EXPERT actions in the env → get real agent (x,y) + block (x,y,angle)
-     This is the "expert / real" track.
-  2. Run CEM planning using stored ground-truth VideoSAUR slots → get planned actions
-     Execute THOSE actions in a SECOND copy of the env (same seed)
-     This gives physically correct T-piece motion for both Frozen and A-B-M models.
-  3. Render from env.states['state'] = [agent_x, agent_y, block_x, block_y, block_angle, ...]
-     All objects stay in physical contact because we're using real physics.
+Root cause of previous bug:
+  Expert actions were recorded from specific initial states (agent+block positions).
+  Replaying them in a randomly-seeded env caused misalignment.
 
-Three-panel GIF:
-  Left:   Expert trajectory (green agent + blue T-piece)
-  Middle: Frozen CEM trajectory (red agent + T-piece)
-  Right:  A-B-M CEM trajectory (teal agent + T-piece)
+Fix:
+  - `pusht_expert_state_meta.pkl` has per-episode initial states.
+  - We pass `options={'state': init_state}` to env.reset(), which sets exact
+    agent_x, agent_y, block_x, block_y, block_angle (from env source: PushT.reset).
+  - Expert replay now starts from the SAME state as the original recordings.
+  - CEM models also start from the same initial state.
 
-Single-panel GIF (for README):
-  One canvas showing all three T-piece trajectories overlaid (agent shown for each).
-
-Outputs to:
-  /workspace/results/gifs2/pusht_env_compare_ep{N}.gif
-  /workspace/results/gifs2/pusht_env_compare_all.gif
-  /workspace/results/gifs2/pusht_env_overlay_ep{N}.gif
+Three panels per GIF:
+  Left:   Expert actions (green agent, blue T-piece)
+  Centre: Frozen CEM planner (red)
+  Right:  A-B-M CEM planner with System M (teal)
 """
 
 import os, sys, math, argparse
-import os; os.environ['SDL_VIDEODRIVER'] = 'offscreen'
+os.environ['SDL_VIDEODRIVER'] = 'offscreen'
 import numpy as np
 import pickle as pkl
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from copy import deepcopy
 from loguru import logger as logging
 
@@ -41,38 +35,31 @@ from mechjepa.planner import CEMPlanner
 import stable_worldmodel as swm
 from stable_worldmodel.policy import Policy
 
-# ── Canvas constants ─────────────────────────────────────────────────────────
-PANEL_W     = 320        # each panel width
-PANEL_H     = 320        # each panel height
+# ── Canvas constants ──────────────────────────────────────────────────────────
+PANEL_W     = 340
+PANEL_H     = 340
 INFO_H      = 56
-ENV_SIZE    = 512.0      # env coordinate range
-BLOCK_SCALE = 24         # T-piece polygon scale (px, at 320px canvas)
-AGENT_R     = 10
-FPS_DELAY   = 80         # ms per frame (~12.5 fps)
-TRAIL_LEN   = 25
-MAX_STEPS   = 100
+ENV_SIZE    = 512.0
+BLOCK_SCALE = 24
+AGENT_R     = 11
+FPS_DELAY   = 80        # ~12.5 fps
+TRAIL_LEN   = 30
+MAX_STEPS   = 120
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG          = (248, 246, 242)
-GRID_COL    = (228, 226, 222)
-INFO_BG     = ( 38,  38,  50)
-
-# Expert (green)
-EXPERT_BLOCK = ( 60, 130, 200)   # blue block
-EXPERT_AGENT = ( 20, 170,  80)   # green agent
-
-# Frozen model (red)
-FROZEN_BLOCK = (210,  65,  50)
-FROZEN_AGENT = (210,  65,  50)
-
-# A-B-M model (teal)
-ABM_BLOCK    = ( 25, 165, 135)
-ABM_AGENT    = ( 25, 165, 135)
-
-GOAL_COL     = (180, 160, 220)   # lavender goal
-ADAPT_FLASH  = (255, 160,   0)
-TEXT_COL     = (240, 240, 240)
-DARK_TEXT    = ( 40,  40,  50)
+# ── Palette ────────────────────────────────────────────────────────────────────
+BG           = (248, 246, 240)
+GRID_COL     = (228, 226, 220)
+INFO_BG      = ( 35,  35,  48)
+EXPERT_BLOCK = ( 55, 125, 200)
+EXPERT_AGENT = ( 20, 170,  80)
+FROZEN_BLOCK = (210,  60,  50)
+FROZEN_AGENT = (180,  50,  40)
+ABM_BLOCK    = ( 25, 165, 130)
+ABM_AGENT    = ( 20, 140, 110)
+GOAL_COL     = (180, 155, 220)
+ADAPT_FLASH  = (255, 155,   0)
+TEXT_COL     = (235, 235, 235)
+GREY         = (120, 120, 130)
 
 MODEL_CFG = dict(
     num_slots=4, slot_dim=128, num_mechanisms=8,
@@ -83,251 +70,165 @@ MODEL_CFG = dict(
 )
 
 
-# ── Geometry helpers ──────────────────────────────────────────────────────────
-def env_to_canvas(x, y, size=PANEL_W):
-    """Convert env coord (0-512) to canvas pixel."""
-    px = int(np.clip(x / ENV_SIZE, 0, 1) * (size - 20) + 10)
-    py = int(np.clip(1 - y / ENV_SIZE, 0, 1) * (size - 20) + 10)
+def env_to_canvas(x, y, w=PANEL_W, h=PANEL_H, margin=18):
+    px = int(np.clip(x / ENV_SIZE, 0, 1) * (w - 2*margin) + margin)
+    py = int(np.clip(1 - y / ENV_SIZE, 0, 1) * (h - 2*margin) + margin)
     return px, py
 
 
 def t_piece_pts(cx, cy, angle, scale=BLOCK_SCALE):
-    """T-piece polygon around (cx,cy) rotated by angle (rad)."""
     s = scale
     local = np.array([
         [-2*s, -s], [2*s, -s], [2*s, 0],
         [ s,    0], [s,   2*s], [-s, 2*s],
         [-s,    0], [-2*s, 0],
     ], dtype=float)
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
-    R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    ca, sa = math.cos(angle), math.sin(angle)
+    R = np.array([[ca, -sa], [sa, ca]])
     pts = (R @ local.T).T
     pts[:, 0] += cx
     pts[:, 1] += cy
     return [tuple(p.astype(int)) for p in pts]
 
 
-def draw_scene(state, block_col, agent_col, trail, size=PANEL_W,
-               adapted=False, goal_state=None, label='', surp=None):
-    """Render a single panel from env state [ax, ay, bx, by, bang, ...]."""
-    img = Image.new('RGBA', (size, size + INFO_H), BG + (255,))
+def draw_panel(state, block_col, agent_col, trail, goal_state,
+               label, surp, adapted, step_i, total,
+               w=PANEL_W, h=PANEL_H):
+    img  = Image.new('RGBA', (w, h + INFO_H), BG + (255,))
     draw = ImageDraw.Draw(img, 'RGBA')
 
     # Grid
-    for i in range(0, size, 40):
-        draw.line([(i, 0), (i, size)], fill=GRID_COL + (255,), width=1)
-        draw.line([(0, i), (size, i)], fill=GRID_COL + (255,), width=1)
+    for i in range(0, w, 40):
+        draw.line([(i, 0), (i, h)], fill=GRID_COL + (255,), width=1)
+    for i in range(0, h, 40):
+        draw.line([(0, i), (w, i)], fill=GRID_COL + (255,), width=1)
 
     # Goal ghost
     if goal_state is not None:
-        gx, gy = env_to_canvas(goal_state[2], goal_state[3], size)
-        bang = goal_state[4]
-        gpts = t_piece_pts(gx, gy, bang, scale=BLOCK_SCALE - 5)
-        draw.polygon(gpts, outline=GOAL_COL + (180,), width=2)
-
-    # Trail
-    for i in range(1, len(trail)):
-        alpha = int(40 + 180 * i / len(trail))
-        draw.line([trail[i-1], trail[i]], fill=block_col + (alpha,), width=2)
-
-    ax, ay = state[0], state[1]
-    bx, by, bang = state[2], state[3], state[4]
-    apx, apy = env_to_canvas(ax, ay, size)
-    bpx, bpy = env_to_canvas(bx, by, size)
-
-    # Block (T-piece)
-    bpts = t_piece_pts(bpx, bpy, bang)
-    draw.polygon(bpts, fill=block_col + (200,), outline=block_col + (255,), width=1)
-
-    # Agent (circle)
-    r = AGENT_R
-    draw.ellipse([apx - r, apy - r, apx + r, apy + r],
-                 fill=agent_col + (230,), outline=(20, 20, 20, 200), width=1)
-
-    # Adapt flash
-    if adapted:
-        for w in range(4):
-            draw.rectangle([w, w, size-1-w, size-1-w],
-                           outline=ADAPT_FLASH + (200 - w*40,), width=1)
-
-    # Info bar
-    draw.rectangle([0, size, size, size + INFO_H], fill=INFO_BG + (255,))
-    draw.line([(0, size), (size, size)], fill=(70, 70, 90, 255), width=1)
-
-    # Color dot + label
-    draw.ellipse([8, size + 10, 20, size + 22], fill=block_col + (255,))
-    draw.text((24, size + 8), label, fill=block_col + (255,))
-
-    if surp is not None:
-        draw.text((8, size + 30), f'Prediction error: {surp:.4f}', fill=TEXT_COL + (180,))
-    if adapted:
-        draw.text((size - 120, size + 30), '⚡ ADAPTING', fill=ADAPT_FLASH + (255,))
-
-    return img
-
-
-def make_tripanel(expert_img, frozen_img, abm_img, size=PANEL_W):
-    gap = 3
-    W = size * 3 + gap * 2
-    H = size + INFO_H
-    out = Image.new('RGBA', (W, H), (200, 200, 200, 255))
-    out.paste(expert_img, (0, 0))
-    out.paste(frozen_img, (size + gap, 0))
-    out.paste(abm_img,    (size * 2 + gap * 2, 0))
-    return out
-
-
-def make_overlay(states_exp, states_froz, states_abm, size=PANEL_W,
-                 trails_e=None, trails_f=None, trails_a=None,
-                 adapted=False, surp_f=0, surp_a=0, goal_state=None, step_i=0, total=1):
-    """Single canvas with all 3 T-pieces overlaid + labels."""
-    img = Image.new('RGBA', (size, size + INFO_H + 20), BG + (255,))
-    draw = ImageDraw.Draw(img, 'RGBA')
-
-    for i in range(0, size, 40):
-        draw.line([(i, 0), (i, size)], fill=GRID_COL + (255,), width=1)
-        draw.line([(0, i), (size, i)], fill=GRID_COL + (255,), width=1)
-
-    if goal_state is not None:
-        gx, gy = env_to_canvas(goal_state[2], goal_state[3], size)
+        gx, gy = env_to_canvas(goal_state[2], goal_state[3], w, h)
         gpts = t_piece_pts(gx, gy, goal_state[4], scale=BLOCK_SCALE - 5)
         draw.polygon(gpts, outline=GOAL_COL + (160,), width=2)
 
-    for trail, col in [(trails_e or [], EXPERT_BLOCK),
-                       (trails_f or [], FROZEN_BLOCK),
-                       (trails_a or [], ABM_BLOCK)]:
-        for i in range(1, len(trail)):
-            alpha = int(40 + 180 * i / len(trail))
-            draw.line([trail[i-1], trail[i]], fill=col + (alpha,), width=2)
+    # Trail
+    for i in range(1, len(trail)):
+        alpha = int(30 + 180 * i / len(trail))
+        draw.line([trail[i-1], trail[i]], fill=block_col + (alpha,), width=2)
 
-    def draw_state(state, bcol, acol, alpha_factor=1.0, outline_only=False):
-        ax, ay = env_to_canvas(state[0], state[1], size)
-        bx, by = env_to_canvas(state[2], state[3], size)
-        bang   = state[4]
-        bpts   = t_piece_pts(bx, by, bang)
-        al     = int(200 * alpha_factor)
-        if outline_only:
-            draw.polygon(bpts, outline=bcol + (al,), width=2)
-        else:
-            draw.polygon(bpts, fill=bcol + (al,), outline=bcol + (255,), width=1)
-        r = AGENT_R
-        if outline_only:
-            draw.ellipse([ax-r, ay-r, ax+r, ay+r], outline=acol + (al,), width=2)
-        else:
-            draw.ellipse([ax-r, ay-r, ax+r, ay+r], fill=acol + (al,), outline=(20,20,20,180), width=1)
+    # Objects
+    ax, ay = env_to_canvas(state[0], state[1], w, h)
+    bx, by = env_to_canvas(state[2], state[3], w, h)
+    bang    = state[4]
 
-    draw_state(states_froz, FROZEN_BLOCK, FROZEN_AGENT, outline_only=True)
-    draw_state(states_abm,  ABM_BLOCK,    ABM_AGENT,    outline_only=True)
-    draw_state(states_exp,  EXPERT_BLOCK, EXPERT_AGENT)   # expert on top, filled
+    bpts = t_piece_pts(bx, by, bang)
+    draw.polygon(bpts, fill=block_col + (210,), outline=block_col + (255,), width=1)
 
+    r = AGENT_R
+    draw.ellipse([ax-r, ay-r, ax+r, ay+r],
+                 fill=agent_col + (240,), outline=(15,15,15,200), width=1)
+
+    # Adapt border
     if adapted:
-        for w in range(4):
-            draw.rectangle([w, w, size-1-w, size-1-w], outline=ADAPT_FLASH + (200-w*40,), width=1)
+        for ww in range(5):
+            draw.rectangle([ww, ww, w-1-ww, h-1-ww],
+                           outline=ADAPT_FLASH + (220 - ww*40,), width=1)
 
     # Progress bar
-    bar_w = int((step_i / max(total-1, 1)) * (size - 4))
-    draw.rectangle([2, size-3, 2+bar_w, size-1], fill=(100, 100, 120, 200))
+    bar_w = int(step_i / max(total-1,1) * (w-4))
+    draw.rectangle([2, h-3, 2+bar_w, h-1], fill=(100,100,120,220))
 
-    # Info bar
-    H_tot = size + INFO_H + 20
-    draw.rectangle([0, size, size, H_tot], fill=INFO_BG + (255,))
-
-    items = [(EXPERT_BLOCK, '● Expert'), (FROZEN_BLOCK, '● Frozen'), (ABM_BLOCK, '●  A-B-M')]
-    for i, (col, lbl) in enumerate(items):
-        draw.ellipse([8 + i*100, size+8, 18+i*100, size+18], fill=col+(255,))
-        draw.text((22+i*100, size+6), lbl, fill=col+(255,))
-
-    impr = surp_f / (surp_a + 1e-8)
-    draw.text((8, size+28),
-              f'Pred err — Frozen: {surp_f:.4f}  A-B-M: {surp_a:.4f}  ({impr:.1f}× better)',
-              fill=TEXT_COL + (180,))
+    # Info strip
+    draw.rectangle([0, h, w, h+INFO_H], fill=INFO_BG + (255,))
+    draw.line([(0, h), (w, h)], fill=(65, 65, 85, 255), width=1)
+    dot_r = 5
+    draw.ellipse([8, h+10, 8+dot_r*2, h+10+dot_r*2], fill=block_col+(255,))
+    draw.text((8+dot_r*2+5, h+7), label, fill=block_col+(255,))
+    if surp is not None:
+        draw.text((8, h+30), f'Pred err: {surp:.4f}', fill=TEXT_COL+(160,))
     if adapted:
-        draw.text((size-130, size+28), '⚡ SYSTEM M ADAPT', fill=ADAPT_FLASH+(255,))
+        draw.text((w-130, h+30), '⚡ ADAPTING', fill=ADAPT_FLASH+(255,))
 
     return img
 
 
-# ── Slot-to-action via CEM ────────────────────────────────────────────────────
-class SlotCEMPolicy:
-    """
-    Given stored VideoSAUR slot sequences, run CEM at each step.
-    Maintains a rolling slot history buffer.
-    """
-    def __init__(self, model, planner, goal_slots, ep_slots, ep_actions, device,
-                 system_m=False, optimizer=None, threshold=0.015, adapt_steps=3):
-        self.model       = model
-        self.planner     = planner
-        self.goal_slots  = goal_slots.to(device)
-        self.ep_slots    = ep_slots    # (T, 4, 128)
-        self.ep_actions  = ep_actions  # (T, 2)
-        self.device      = device
-        self.system_m    = system_m
-        self.optimizer   = optimizer
-        self.threshold   = threshold
-        self.adapt_steps = adapt_steps
+def stitch(p1, p2, p3, w=PANEL_W):
+    gap = 3
+    W = w*3 + gap*2
+    H = p1.height
+    out = Image.new('RGBA', (W, H), (180,180,180,255))
+    out.paste(p1, (0, 0))
+    out.paste(p2, (w + gap, 0))
+    out.paste(p3, (w*2 + gap*2, 0))
+    return out
 
-        self.hist_slots = []
-        self.hist_acts  = []
-        self.t          = 0
-        self.surp_log   = []
-        self.adapt_log  = []
+
+# ── Slot-CEM policy (runs model in slot space, outputs env actions) ───────────
+class SlotCEMPolicy:
+    def __init__(self, model, planner, goal_slots, ep_slots, ep_actions,
+                 device, system_m=False, optimizer=None, threshold=0.015, adapt_steps=3):
+        self.model     = model
+        self.planner   = planner
+        self.goal_s    = goal_slots.to(device)
+        self.ep_slots  = ep_slots
+        self.ep_acts   = ep_actions
+        self.device    = device
+        self.system_m  = system_m
+        self.optimizer = optimizer
+        self.thresh    = threshold
+        self.n_adapt   = adapt_steps
+        self.hist_s    = []
+        self.hist_a    = []
+        self.t         = 0
+        self.surp_log  = []
+        self.adapt_log = []
 
     def reset(self):
-        self.hist_slots = []
-        self.hist_acts  = []
-        self.t = 0
-        self.surp_log   = []
-        self.adapt_log  = []
+        self.hist_s = []; self.hist_a = []; self.t = 0
+        self.surp_log = []; self.adapt_log = []
 
     def step(self):
-        """Advance one timestep. Returns (action np (2,), surprise, adapted)."""
-        t = self.t
-        T = self.ep_slots.shape[0]
+        t = self.t; T = len(self.ep_slots)
         if t >= T - 1:
+            self.t += 1
             return np.zeros(2, dtype=np.float32), 0.0, False
 
-        curr = torch.from_numpy(self.ep_slots[t]).float().unsqueeze(0).to(self.device)
-        self.hist_slots.append(curr)
-        if len(self.hist_slots) > 3: self.hist_slots.pop(0)
-
-        if len(self.hist_acts) < 3:
-            self.hist_acts.insert(0, torch.from_numpy(
-                self.ep_actions[max(0, t-1)]).float().unsqueeze(0).to(self.device))
-        if len(self.hist_acts) > 3: self.hist_acts.pop(0)
-
+        cur  = torch.from_numpy(self.ep_slots[t]).float().unsqueeze(0).to(self.device)
+        self.hist_s.append(cur)
+        if len(self.hist_s) > 3: self.hist_s.pop(0)
+        if len(self.hist_a) < 3:
+            self.hist_a.insert(0, torch.from_numpy(
+                self.ep_acts[max(0, t-1)]).float().unsqueeze(0).to(self.device))
+        if len(self.hist_a) > 3: self.hist_a.pop(0)
         self.t += 1
 
-        if len(self.hist_slots) < 3:
+        if len(self.hist_s) < 3:
             return np.zeros(2, dtype=np.float32), 0.0, False
 
-        next_real = torch.from_numpy(self.ep_slots[min(t+1, T-1)]).float().unsqueeze(0).to(self.device)
-        hist_t  = torch.cat(self.hist_slots, dim=0).unsqueeze(0)
-        hact_t  = torch.cat(self.hist_acts,  dim=0).unsqueeze(0)
+        nxt  = torch.from_numpy(self.ep_slots[min(t+1, T-1)]).float().unsqueeze(0).to(self.device)
+        ht   = torch.cat(self.hist_s, dim=0).unsqueeze(0)
+        hat  = torch.cat(self.hist_a, dim=0).unsqueeze(0)
 
         with torch.no_grad():
-            pred = self.model.inference(hist_t, actions=hact_t).squeeze(1)
-        surp = F.mse_loss(pred, next_real).item()
+            pred = self.model.inference(ht, actions=hat).squeeze(1)
+        surp = F.mse_loss(pred, nxt).item()
         adapted = False
 
-        if self.system_m and self.optimizer and surp > self.threshold:
+        if self.system_m and self.optimizer and surp > self.thresh:
             adapted = True
             self.model.train()
-            for _ in range(self.adapt_steps):
+            for _ in range(self.n_adapt):
                 self.optimizer.zero_grad()
-                p = self.model.differentiable_inference(hist_t, actions=hact_t).squeeze(1)
-                loss = F.mse_loss(p, next_real)
+                p = self.model.differentiable_inference(ht, actions=hat).squeeze(1)
+                loss = F.mse_loss(p, nxt)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)
                 self.optimizer.step()
             self.model.eval()
 
-        planned = self.planner.plan(hist_t, hact_t, self.goal_slots)  # (1, H, 2)
-        action = planned[0, 0, :].detach().cpu().numpy()  # (2,)
+        planned = self.planner.plan(ht, hat, self.goal_s)
+        action  = planned[0, 0, :].detach().cpu().numpy()
 
-        # Advance action buffer
-        self.hist_acts.append(torch.from_numpy(action).float().unsqueeze(0).to(self.device))
-        if len(self.hist_acts) > 3: self.hist_acts.pop(0)
-
+        self.hist_a.append(torch.from_numpy(action).float().unsqueeze(0).to(self.device))
+        if len(self.hist_a) > 3: self.hist_a.pop(0)
         self.surp_log.append(surp)
         self.adapt_log.append(adapted)
         return action, surp, adapted
@@ -335,114 +236,101 @@ class SlotCEMPolicy:
 
 class ExpertPolicy(Policy):
     def __init__(self, actions):
-        self.actions = actions  # (T, 2)
-        self.t = 0
-    def reset(self):
-        self.t = 0
+        self.actions = actions; self.t = 0
+    def reset(self): self.t = 0
     def get_action(self, infos):
         a = self.actions[self.t] if self.t < len(self.actions) else np.zeros(2)
-        self.t += 1
-        return a.reshape(1, 2).astype(np.float32)
+        self.t = min(self.t + 1, len(self.actions) - 1)
+        return a.reshape(1,2).astype(np.float32)
 
 
-class CEMEnvPolicy(Policy):
-    def __init__(self, slot_cem, actions_fallback):
+class WrapCEMPolicy(Policy):
+    def __init__(self, slot_cem):
         self.slot_cem = slot_cem
-        self.actions_fallback = actions_fallback
-        self._next_action = np.zeros(2, dtype=np.float32)
-        self._surp = 0.0
-        self._adapted = False
+        self._action  = np.zeros(2, dtype=np.float32)
+        self.surp     = 0.0
+        self.adapted  = False
 
     def get_action(self, infos):
-        return self._next_action.reshape(1, 2)
+        return self._action.reshape(1, 2)
 
-    def compute_next(self):
+    def compute(self):
         a, s, ad = self.slot_cem.step()
-        self._next_action = a
-        self._surp = s
-        self._adapted = ad
+        self._action = a; self.surp = s; self.adapted = ad
         return a, s, ad
 
 
-def run_episode_gifs(ep_slots, ep_actions, goal_slots,
-                     frozen_model, abm_model, frozen_plan, abm_plan, optimizer,
-                     goal_state, device, threshold=0.015):
-    T = min(len(ep_slots), MAX_STEPS + 3)
+def run_episode(ep_key, ep_slots, ep_actions, ep_states,
+                goal_slots, goal_state,
+                frozen_model, abm_model, frozen_plan, abm_plan, optimizer,
+                device, threshold=0.015):
+    """Run expert + frozen CEM + A-B-M CEM in 3 envs with matching initial state."""
 
-    # Policy objects
+    init_state = ep_states[0]   # [ax, ay, bx, by, bang, vx, vy]
+    reset_opts = {'state': init_state, 'goal_state': goal_state}
+
     expert_pol = ExpertPolicy(ep_actions)
 
-    frozen_slot = SlotCEMPolicy(frozen_model, frozen_plan, goal_slots, ep_slots, ep_actions, device)
-    abm_slot    = SlotCEMPolicy(abm_model,   abm_plan,   goal_slots, ep_slots, ep_actions, device,
-                                system_m=True, optimizer=optimizer, threshold=threshold)
+    frz_cem  = SlotCEMPolicy(frozen_model, frozen_plan, goal_slots, ep_slots, ep_actions, device)
+    abm_cem  = SlotCEMPolicy(abm_model,   abm_plan,   goal_slots, ep_slots, ep_actions, device,
+                             system_m=True, optimizer=optimizer, threshold=threshold)
+    frz_pol  = WrapCEMPolicy(frz_cem)
+    abm_pol  = WrapCEMPolicy(abm_cem)
 
-    frozen_pol = CEMEnvPolicy(frozen_slot, ep_actions)
-    abm_pol    = CEMEnvPolicy(abm_slot,    ep_actions)
-
-    # Three env instances (same seed → same starting state)
-    seed = 42
-    def make_env():
+    def make_env(pol):
         e = swm.World('swm/PushT-v1', num_envs=1, image_shape=(96,96),
-                      max_episode_steps=MAX_STEPS + 10, verbose=0)
+                      max_episode_steps=MAX_STEPS+10, verbose=0)
+        e.set_policy(pol)
+        e.reset(options=reset_opts)
         return e
 
-    env_exp   = make_env(); env_exp.set_policy(expert_pol);  env_exp.reset(seed=seed)
-    env_froz  = make_env(); env_froz.set_policy(frozen_pol); env_froz.reset(seed=seed)
-    env_abm   = make_env(); env_abm.set_policy(abm_pol);     env_abm.reset(seed=seed)
+    env_e = make_env(expert_pol)
+    env_f = make_env(frz_pol)
+    env_a = make_env(abm_pol)
 
-    tri_frames, ov_frames = [], []
+    tri_frames = []
     tr_e, tr_f, tr_a = [], [], []
 
     for step_i in range(MAX_STEPS):
-        # Get current states
-        s_exp  = env_exp.states['state'][0]   if env_exp.states  else np.zeros(7)
-        s_froz = env_froz.states['state'][0]  if env_froz.states else np.zeros(7)
-        s_abm  = env_abm.states['state'][0]   if env_abm.states  else np.zeros(7)
+        s_e = env_e.states['state'][0] if env_e.states else np.zeros(7)
+        s_f = env_f.states['state'][0] if env_f.states else np.zeros(7)
+        s_a = env_a.states['state'][0] if env_a.states else np.zeros(7)
 
-        # Block centre for trails
-        bp_e = env_to_canvas(s_exp[2],  s_exp[3],  PANEL_W)
-        bp_f = env_to_canvas(s_froz[2], s_froz[3], PANEL_W)
-        bp_a = env_to_canvas(s_abm[2],  s_abm[3],  PANEL_W)
-        tr_e.append(bp_e); tr_f.append(bp_f); tr_a.append(bp_a)
+        # Block trail positions
+        tr_e.append(env_to_canvas(s_e[2], s_e[3]))
+        tr_f.append(env_to_canvas(s_f[2], s_f[3]))
+        tr_a.append(env_to_canvas(s_a[2], s_a[3]))
         if len(tr_e) > TRAIL_LEN: tr_e.pop(0)
         if len(tr_f) > TRAIL_LEN: tr_f.pop(0)
         if len(tr_a) > TRAIL_LEN: tr_a.pop(0)
 
-        # Compute CEM actions (sets internal state for next step call)
-        _, surp_f, adapted_f = frozen_pol.compute_next()
-        _, surp_a, adapted_a = abm_pol.compute_next()
+        _,  surp_f, adpt_f = frz_pol.compute()
+        _,  surp_a, adpt_a = abm_pol.compute()
 
-        # Draw panels
-        p_exp  = draw_scene(s_exp,  EXPERT_BLOCK, EXPERT_AGENT, list(tr_e),
-                            PANEL_W, goal_state=goal_state, label='Expert Actions (GT)')
-        p_froz = draw_scene(s_froz, FROZEN_BLOCK, FROZEN_AGENT, list(tr_f),
-                            PANEL_W, adapted=False, goal_state=goal_state,
-                            label='Frozen Model', surp=surp_f)
-        p_abm  = draw_scene(s_abm,  ABM_BLOCK, ABM_AGENT, list(tr_a),
-                            PANEL_W, adapted=adapted_a, goal_state=goal_state,
-                            label='A-B-M Agent', surp=surp_a)
+        p_e = draw_panel(s_e, EXPERT_BLOCK, EXPERT_AGENT, list(tr_e),
+                         goal_state, 'Expert Actions', None, False, step_i, MAX_STEPS)
+        p_f = draw_panel(s_f, FROZEN_BLOCK, FROZEN_AGENT, list(tr_f),
+                         goal_state, 'Frozen Model', surp_f, False, step_i, MAX_STEPS)
+        p_a = draw_panel(s_a, ABM_BLOCK, ABM_AGENT, list(tr_a),
+                         goal_state, 'A-B-M Agent', surp_a, adpt_a, step_i, MAX_STEPS)
 
-        tri_frames.append(make_tripanel(p_exp, p_froz, p_abm))
-        ov_frames.append(make_overlay(
-            s_exp, s_froz, s_abm, PANEL_W,
-            list(tr_e), list(tr_f), list(tr_a),
-            adapted_a, surp_f, surp_a, goal_state,
-            step_i, MAX_STEPS,
-        ))
+        tri_frames.append(stitch(p_e, p_f, p_a))
 
-        # Step all envs
-        env_exp.step()
-        env_froz.step()
-        env_abm.step()
+        env_e.step(); env_f.step(); env_a.step()
 
-        done_e = env_exp.terminateds is not None and env_exp.terminateds[0]
-        done_f = env_froz.terminateds is not None and env_froz.terminateds[0]
-        done_a = env_abm.terminateds  is not None and env_abm.terminateds[0]
-        if done_e and done_f and done_a:
+        done = all([
+            env_e.terminateds is not None and env_e.terminateds[0],
+            env_f.terminateds is not None and env_f.terminateds[0],
+            env_a.terminateds is not None and env_a.terminateds[0],
+        ])
+        if done:
             break
 
-    env_exp.close(); env_froz.close(); env_abm.close()
-    return tri_frames, ov_frames
+    logstr = (f'  Frozen surp={np.mean(frz_cem.surp_log):.4f}'
+              f'  A-B-M surp={np.mean(abm_cem.surp_log):.4f}'
+              f'  adaptations={sum(abm_cem.adapt_log)}')
+    env_e.close(); env_f.close(); env_a.close()
+    return tri_frames, logstr
 
 
 def save_gif(frames, path):
@@ -454,11 +342,12 @@ def save_gif(frames, path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt',      default='/workspace/checkpoints/mechjepa_pusht_act_best.ckpt')
-    parser.add_argument('--data',      default='/workspace/data/pusht_slots_actions.pkl')
-    parser.add_argument('--out_dir',   default='/workspace/results/gifs2')
-    parser.add_argument('--episodes',  type=int, default=4)
-    parser.add_argument('--threshold', type=float, default=0.015)
+    parser.add_argument('--ckpt',       default='/workspace/checkpoints/mechjepa_pusht_act_best.ckpt')
+    parser.add_argument('--data',       default='/workspace/data/pusht_slots_actions.pkl')
+    parser.add_argument('--state_meta', default='/workspace/data/pusht_expert_state_meta.pkl')
+    parser.add_argument('--out_dir',    default='/workspace/results/gifs_fixed')
+    parser.add_argument('--episodes',   type=int, default=4)
+    parser.add_argument('--threshold',  type=float, default=0.015)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -467,12 +356,16 @@ def main():
     logging.info('Loading data...')
     with open(args.data, 'rb') as f:
         data = pkl.load(f)
-    val = data['val']
-    ep_keys = sorted(list(val.keys()))[:args.episodes]
+    with open(args.state_meta, 'rb') as f:
+        state_meta = pkl.load(f)
 
+    val      = data['val']
+    val_stat = state_meta['val']
+    ep_keys  = sorted([k for k in val.keys() if k in val_stat])[:args.episodes]
+
+    # Goal: use last state of ep0 as goal
+    goal_state_arr = val_stat[ep_keys[0]][-1]  # [ax, ay, bx, by, bang, vx, vy]
     goal_slots = torch.from_numpy(val[ep_keys[0]]['slots'][-1]).float()
-    # Goal state: use env center as approximate goal visual
-    goal_state = np.array([256.0, 256.0, 256.0, 180.0, 0.3, 0.0, 0.0])
 
     def load_model(ckpt):
         m = MechJEPA(**MODEL_CFG)
@@ -489,25 +382,29 @@ def main():
     ])
     abm_plan = CEMPlanner(abm_model, horizon=10, num_samples=256, num_iterations=5, device=device)
 
-    all_tri, all_ov = [], []
-
+    all_frames = []
     for ep_i, key in enumerate(ep_keys):
         logging.info(f'▶ Episode {ep_i+1}/{len(ep_keys)}: {key}')
-        ep = val[key]
-        tri_frames, ov_frames = run_episode_gifs(
-            ep['slots'], ep['actions'], goal_slots,
-            frozen_model, abm_model, frozen_plan, abm_plan, optimizer,
-            goal_state, device=device, threshold=args.threshold,
-        )
-        save_gif(tri_frames, os.path.join(args.out_dir, f'pusht_env_compare_ep{ep_i+1:02d}.gif'))
-        save_gif(ov_frames,  os.path.join(args.out_dir, f'pusht_env_overlay_ep{ep_i+1:02d}.gif'))
-        all_tri.extend(tri_frames)
-        all_ov.extend(ov_frames)
-        logging.info(f'  Episode {ep_i+1} done ({len(tri_frames)} frames)')
+        ep_slots   = val[key]['slots']
+        ep_actions = val[key]['actions']
+        ep_states  = val_stat[key]
 
-    save_gif(all_tri, os.path.join(args.out_dir, 'pusht_env_compare_all.gif'))
-    save_gif(all_ov,  os.path.join(args.out_dir, 'pusht_env_overlay_all.gif'))
-    logging.info(f'All done. GIFs saved to {args.out_dir}/')
+        init = ep_states[0]
+        logging.info(f'  Init: agent=({init[0]:.0f},{init[1]:.0f})  block=({init[2]:.0f},{init[3]:.0f},ang={init[4]:.2f})')
+
+        frames, logstr = run_episode(
+            key, ep_slots, ep_actions, ep_states,
+            goal_slots, goal_state_arr,
+            frozen_model, abm_model, frozen_plan, abm_plan, optimizer,
+            device=device, threshold=args.threshold,
+        )
+        logging.info(logstr)
+
+        save_gif(frames, os.path.join(args.out_dir, f'pusht_ep{ep_i+1:02d}.gif'))
+        all_frames.extend(frames)
+
+    save_gif(all_frames, os.path.join(args.out_dir, 'pusht_all.gif'))
+    logging.info(f'Done. Saved to {args.out_dir}/')
 
 
 if __name__ == '__main__':
