@@ -94,8 +94,9 @@ def compute_surprise_from_prediction(
             z_history, m_ij=m_ij, return_attention=True,
         )
 
-    # Extract predicted next frame
-    z_pred = pred_out[:, T_hist, :, :]  # (B, S, D) — first predicted frame
+    # Extract predicted next frame — inference() returns (B, T_pred, S, D),
+    # the first (and only) predicted frame is at index 0.
+    z_pred = pred_out[:, 0, :, :]  # (B, S, D)
 
     # Per-slot error
     slot_error = compute_per_slot_surprise(z_pred, z_next_actual)
@@ -198,7 +199,7 @@ class SystemM:
         As the model improves, surprise naturally decreases. We track the
         running mean and set the threshold relative to it.
         """
-        if len(self.surprise_history) < 100:
+        if len(self.surprise_history) < 10:  # need at least 10 samples
             return
 
         recent = self.surprise_history[-100:]

@@ -28,11 +28,14 @@ def run_ab_loop(
     logging.info("Loading models...")
     # These parameters should match your training setup
     world_model = MechJEPA(
-        num_slots=4, slot_dim=128, num_mechanisms=8, 
-        history_frames=3, pred_frames=1, action_dim=2
+        num_slots=4, slot_dim=128, num_mechanisms=8,
+        history_frames=3, pred_frames=1, action_dim=2,
+        transformer_depth=6, transformer_heads=16,
+        transformer_dim_head=64, transformer_mlp_dim=2048,
+        edge_hidden_dim=256,
     )
     if os.path.exists(model_path):
-        world_model.load_state_dict(torch.load(model_path, map_location=device))
+        world_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
     world_model.to(device).eval()
     
     encoder = VideoSAUREncoder(img_size=96, num_slots=4, slot_dim=128)

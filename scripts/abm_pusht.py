@@ -1,185 +1,274 @@
+"""
+A-B-M Agent Demo for Push-T (latent-space version).
+
+Demonstrates the full System A / System B / System M loop:
+  - System A: MechJEPA world model predicts the next slot state
+  - System B: CEM planner finds an action sequence toward a goal
+  - System M: Monitors per-slot prediction surprise; triggers online
+              adaptation when surprise exceeds a threshold
+
+Distribution shift: we perturb the slot observations with a scaling
+factor alpha > 1 to simulate a heavier block (larger, slower dynamics).
+This is the cleanest way to test the loop without a pixel encoder.
+
+Conditions compared:
+  1. Frozen model  — no System M, no gradient updates at test time
+  2. A-B-M agent   — System M triggers adaptation on surprising steps
+
+Usage:
+    python scripts/abm_pusht.py \\
+        --ckpt /workspace/checkpoints/mechjepa_pusht_act_best.ckpt \\
+        --data /workspace/data/pusht_slots_actions.pkl
+"""
+
+import argparse
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import gymnasium as gym
 import pickle as pkl
-import os
+from copy import deepcopy
 from loguru import logger as logging
-from tqdm import tqdm
-import stable_worldmodel as swm
 
 from mechjepa.model import MechJEPA
 from mechjepa.planner import CEMPlanner
-from mechjepa.encoder import VideoSAUREncoder
-from mechjepa.system_m import compute_surprise_from_prediction
 
-def online_adaptation_step(model, optimizer, history_slots, hist_actions, actual_next, steps=5):
+
+# ── Model config must match the training run exactly ──────────────────────────
+MODEL_CFG = dict(
+    num_slots=4, slot_dim=128, num_mechanisms=8,
+    history_frames=3, pred_frames=1, action_dim=2,
+    transformer_depth=6, transformer_heads=16,
+    transformer_dim_head=64, transformer_mlp_dim=2048,
+    edge_hidden_dim=256,
+)
+
+
+def load_model(ckpt_path: str, device: str) -> MechJEPA:
+    model = MechJEPA(**MODEL_CFG)
+    sd = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(sd)
+    return model.to(device)
+
+
+def compute_surprise(model: MechJEPA, history: torch.Tensor,
+                     hist_actions: torch.Tensor,
+                     actual_next: torch.Tensor) -> float:
     """
-    Run gradient updates on the surprise boundary.
-    history_slots: (1, T_hist, S, D)
-    hist_actions: (1, T_hist, action_dim)
-    actual_next: (1, S, D)
+    Simple per-slot prediction error (MSE) as the surprise metric.
+
+    Args:
+        history:      (1, T_hist, S, D)
+        hist_actions: (1, T_hist, action_dim)
+        actual_next:  (1, S, D)  — the REAL observed next frame
+
+    Returns:
+        scalar surprise (mean MSE over all slots)
+    """
+    with torch.no_grad():
+        pred_next = model.inference(history, actions=hist_actions)  # (1, 1, S, D)
+    pred_next = pred_next.squeeze(1)  # (1, S, D)
+    return F.mse_loss(pred_next, actual_next).item()
+
+
+def adaptation_step(model: MechJEPA, optimizer: torch.optim.Optimizer,
+                    history: torch.Tensor, hist_actions: torch.Tensor,
+                    actual_next: torch.Tensor, n_steps: int = 3) -> float:
+    """
+    Take n_steps gradient steps to minimise prediction error on the
+    current surprising transition.  Only the codebook and predictor
+    are updated; this is intentionally narrow to avoid forgetting.
+
+    Returns: loss after the last step
     """
     model.train()
-    for _ in range(steps):
+    last_loss = float("nan")
+    for _ in range(n_steps):
         optimizer.zero_grad()
-        
-        # Predict next frame using action-conditioned dynamics
-        pred_next = model.inference(history_slots, actions=hist_actions) # (1, 1, S, D)
-        pred_next = pred_next.squeeze(1) # (1, S, D)
-        
-        # Simple MSE loss against the real observation
-        loss = torch.nn.functional.mse_loss(pred_next, actual_next)
+        pred_next = model.inference(history, actions=hist_actions).squeeze(1)
+        loss = F.mse_loss(pred_next, actual_next)
         loss.backward()
-        
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
-        
+        last_loss = loss.item()
     model.eval()
+    return last_loss
 
-def run_abm_demo(
-    model_path, 
-    encoder_path, 
-    data_path, 
-    num_episodes=5, 
-    max_steps=200, 
-    horizon=16, 
-    adaptation_steps=5,
-    surprise_threshold=0.05,
-    device="cuda"
-):
+
+def run_episode(
+    model: MechJEPA,
+    planner: CEMPlanner,
+    slots_seq: torch.Tensor,       # (T, S, D) — full episode slots
+    actions_seq: torch.Tensor,     # (T, action_dim)
+    goal_slots: torch.Tensor,      # (S, D)
+    shift_alpha: float = 1.0,      # OOD slot-scale factor (1 = in-distribution)
+    system_m: bool = False,
+    optimizer=None,
+    surprise_threshold: float = 0.02,
+    adaptation_steps: int = 3,
+    device: str = "cuda",
+) -> dict:
     """
-    Run the full A-B-M loop:
-    1. System A: World Model
-    2. System B: Planner
-    3. System M: Surprise monitor -> Adaptation trigger
+    Run one 'episode' stepping through the supplied slot sequence.
+
+    The OOD distribution shift is applied by scaling observed slots
+    by shift_alpha (>1 makes objects appear 'heavier'/larger, <1 lighter).
+    The world model was trained on alpha=1.0 data.
+
+    Returns: dict with per-step metrics
     """
-    logging.info("Loading models...")
-    world_model = MechJEPA(
-        num_slots=4, slot_dim=128, num_mechanisms=8, 
-        history_frames=3, pred_frames=1, action_dim=2
-    )
-    if os.path.exists(model_path):
-        world_model.load_state_dict(torch.load(model_path, map_location=device))
-    world_model.to(device).eval()
-    
-    # We only optimize the bottleneck (and optionally predictor) during adaptation
-    # Often, updating just the codebook is faster and prevents catastrophic forgetting
-    optimizer = torch.optim.AdamW([
-        {'params': world_model.codebook.parameters(), 'lr': 1e-3},
-        {'params': world_model.predictor.parameters(), 'lr': 1e-4}
-    ])
-    
-    encoder = VideoSAUREncoder(img_size=96, num_slots=4, slot_dim=128)
-    if os.path.exists(encoder_path):
-        # Implementation depends on exact ckpt mapping
-        pass 
-    encoder.to(device).eval()
-    
-    with open(data_path, "rb") as f:
+    T, S, D = slots_seq.shape
+    history_size = 3
+    horizon = planner.horizon
+
+    # Circular history buffers
+    hist_slots = []   # list of (1, S, D) tensors
+    hist_acts  = []   # list of (1, action_dim) tensors
+
+    adapt_count = 0
+    surprise_log = []
+    planning_error_log = []
+
+    for t in range(T - 1):
+        # ── Observe (with optional OOD shift) ──────────────────────────────
+        obs_slots = slots_seq[t].unsqueeze(0) * shift_alpha  # (1, S, D)
+
+        hist_slots.append(obs_slots)
+        if len(hist_slots) > history_size:
+            hist_slots.pop(0)
+
+        if len(hist_acts) == 0 or len(hist_acts) < history_size:
+            # Pad with the actual expert action (or zero for very first step)
+            hist_acts.insert(0, actions_seq[max(0, t - 1)].unsqueeze(0))
+        if len(hist_acts) > history_size:
+            hist_acts.pop(0)
+
+        if len(hist_slots) < history_size:
+            continue  # need full history before monitoring or planning
+
+        # Stack buffers
+        hist_t  = torch.cat(hist_slots, dim=0).unsqueeze(0)   # (1, T_h, S, D)
+        hact_t  = torch.cat(hist_acts,  dim=0).unsqueeze(0)   # (1, T_h, 2)
+
+        # ── System M: compute surprise vs actual next frame ─────────────────
+        next_obs = slots_seq[t + 1].unsqueeze(0) * shift_alpha  # (1, S, D)
+        surprise = compute_surprise(model, hist_t, hact_t, next_obs)
+        surprise_log.append(surprise)
+
+        if system_m and optimizer is not None and surprise > surprise_threshold:
+            adapt_count += 1
+            adaptation_step(model, optimizer, hist_t, hact_t, next_obs,
+                            n_steps=adaptation_steps)
+
+        # ── System B: CEM plan toward goal ─────────────────────────────────
+        planned = planner.plan(hist_t, hact_t, goal_slots)  # (1, H, 2)
+
+        # One-step planning error: compare predicted next vs actual next (in distribution)
+        with torch.no_grad():
+            step_act = planned[:, 0:1, :]  # (1, 1, 2)
+            curr_acts = torch.cat([hact_t[:, 1:, :], step_act], dim=1)
+            pred_next  = model.inference(hist_t, actions=curr_acts).squeeze(1)
+        planning_err = F.mse_loss(pred_next, next_obs).item()
+        planning_error_log.append(planning_err)
+
+        # Advance expert action buffer
+        hist_acts.append(actions_seq[t].unsqueeze(0))
+        if len(hist_acts) > history_size:
+            hist_acts.pop(0)
+
+    return {
+        "surprise":      np.array(surprise_log),
+        "planning_err":  np.array(planning_error_log),
+        "adapt_count":   adapt_count,
+        "mean_surprise": float(np.mean(surprise_log)) if surprise_log else 0.0,
+        "mean_plan_err": float(np.mean(planning_error_log)) if planning_error_log else 0.0,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt",      default="/workspace/checkpoints/mechjepa_pusht_act_best.ckpt")
+    parser.add_argument("--data",      default="/workspace/data/pusht_slots_actions.pkl")
+    parser.add_argument("--shift",     type=float, default=1.4,
+                        help="OOD slot scale factor (1.0 = in-distribution, 1.4 = heavy-block shift)")
+    parser.add_argument("--threshold", type=float, default=0.015,
+                        help="Surprise threshold for System M adaptation trigger")
+    parser.add_argument("--adapt_steps", type=int, default=3)
+    parser.add_argument("--horizon",   type=int, default=10)
+    parser.add_argument("--episodes",  type=int, default=5,
+                        help="Number of validation episodes to evaluate")
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── Load data ─────────────────────────────────────────────────────────
+    logging.info(f"Loading data from {args.data}")
+    with open(args.data, "rb") as f:
         data = pkl.load(f)
-    val_data = data.get("val", data)
-    ep_keys = sorted(list(val_data.keys()))
-    goal_slots = torch.from_numpy(val_data[ep_keys[0]]["slots"][-1]).float().to(device)
-    
-    # Setup OOD Environment (e.g. 2x block size to simulate mass/friction change if physics isn't exported)
-    logging.info("Setting up Push-T OOD environment (Double block scale)...")
-    world = swm.World('swm/PushT-v1', num_envs=1, image_shape=(96, 96), goal_conditioned=False)
-    
-    # Let's apply severe distribution shift: scale block up and shift start position
-    from stable_worldmodel.world import PlanConfig
-    ood_cfg = PlanConfig.get_default('swm/PushT-v1')
-    ood_cfg.block.scale.range = [40.0, 60.0]  # Standard is usually 20-30
-    
-    system_m = world_model.system_m
-    system_m.surprise_threshold = surprise_threshold
-    planner = CEMPlanner(world_model, horizon=horizon, device=device)
-    
-    successes = 0
-    total_adaptations = 0
-    
-    for ep_idx in range(num_episodes):
-        obs, _ = world.reset(options={'config': ood_cfg})
-        history_slots = []
-        history_actions = []
-        
-        logging.info(f"Starting OOD Episode {ep_idx+1}")
-        pbar = tqdm(range(max_steps))
-        
-        for step in pbar:
-            # 1. Observe
-            pixels = torch.from_numpy(obs['pixels']).float().to(device)
-            pixels = pixels.permute(0, 3, 1, 2) / 255.0
-            
-            with torch.no_grad():
-                curr_slots = encoder(pixels)
-            
-            # --- System M Monitoring (evaluate previous action's outcome) ---
-            if len(history_slots) == 3 and len(history_actions) == 3:
-                hist_tensor = torch.cat(history_slots, dim=0).unsqueeze(0)
-                hist_act_tensor = torch.cat(history_actions, dim=0).unsqueeze(0)
-                
-                # Check surprise between our expected outcome and reality
-                surprise_result = compute_surprise_from_prediction(
-                    world_model.predictor, 
-                    world_model.codebook,
-                    hist_tensor,
-                    curr_slots.squeeze(0) # actual next state
-                )
-                
-                max_surprise = surprise_result["max_surprise"].item()
-                
-                # If surprising, trigger online adaptation
-                if system_m.should_learn(max_surprise):
-                    total_adaptations += 1
-                    pbar.set_description(f"ADAPTING (Surprise: {max_surprise:.3f})")
-                    online_adaptation_step(
-                        world_model, optimizer, 
-                        hist_tensor, hist_act_tensor, curr_slots.squeeze(0),
-                        steps=adaptation_steps
-                    )
-                    system_m.update_threshold() # auto-adjust threshold
-            
-            # Update history buffers for the *current* frame
-            history_slots.append(curr_slots)
-            if len(history_slots) > 3:
-                history_slots.pop(0)
-            
-            # 2. Plan and Act
-            if len(history_slots) < 3:
-                action = torch.zeros(1, 2, device=device)
-            else:
-                while len(history_actions) < 3:
-                    history_actions.insert(0, torch.zeros(1, 2, device=device))
-                    
-                hist_tensor = torch.cat(history_slots, dim=0).unsqueeze(0)
-                hist_act_tensor = torch.cat(history_actions[-3:], dim=0).unsqueeze(0)
-                
-                planned_actions = planner.plan(hist_tensor, hist_act_tensor, goal_slots)
-                action = planned_actions[:, 0, :]
-            
-            history_actions.append(action)
-            if len(history_actions) > 3:
-                history_actions.pop(0)
-                
-            obs, reward, terminated, truncated, _ = world.step(action)
-            
-            pbar.set_postfix({"reward": f"{reward.mean().item():.3f}", "adapts": total_adaptations})
-            if terminated.any() or truncated.any():
-                if reward.mean() > 0.9:
-                    successes += 1
-                break
-        
-    logging.info(f"OOD Eval complete. Success: {successes}/{num_episodes}. Total Adaptations: {total_adaptations}")
-    world.close()
+    val_data = data["val"]
+    ep_keys  = sorted(list(val_data.keys()))[:args.episodes]
+    logging.info(f"Using {len(ep_keys)} val episodes, OOD shift alpha={args.shift}")
+
+    # Hardcode a fixed goal: last frame of the first validation episode
+    goal_slots = torch.from_numpy(
+        val_data[ep_keys[0]]["slots"][-1]
+    ).float().to(device)
+
+    # ── Condition 1: Frozen model ─────────────────────────────────────────
+    logging.info("▶ Condition 1: Frozen model (no System M)")
+    frozen_model = load_model(args.ckpt, device).eval()
+    frozen_planner = CEMPlanner(frozen_model, horizon=args.horizon,
+                                num_samples=256, num_iterations=5, device=device)
+
+    frozen_results = []
+    for key in ep_keys:
+        ep = val_data[key]
+        slots   = torch.from_numpy(ep["slots"]).float().to(device)
+        actions = torch.from_numpy(ep["actions"]).float().to(device)
+        r = run_episode(frozen_model, frozen_planner, slots, actions, goal_slots,
+                        shift_alpha=args.shift, system_m=False, device=device)
+        frozen_results.append(r)
+        logging.info(f"  {key}: surprise={r['mean_surprise']:.4f}  plan_err={r['mean_plan_err']:.4f}")
+
+    # ── Condition 2: A-B-M Agent ──────────────────────────────────────────
+    logging.info("▶ Condition 2: A-B-M Agent (System M active)")
+    abm_model = load_model(args.ckpt, device)
+    abm_model.eval()
+    optimizer = torch.optim.AdamW([
+        {"params": abm_model.codebook.parameters(),  "lr": 5e-4},
+        {"params": abm_model.predictor.parameters(), "lr": 1e-4},
+    ])
+    abm_planner = CEMPlanner(abm_model, horizon=args.horizon,
+                             num_samples=256, num_iterations=5, device=device)
+
+    abm_results = []
+    for key in ep_keys:
+        ep = val_data[key]
+        slots   = torch.from_numpy(ep["slots"]).float().to(device)
+        actions = torch.from_numpy(ep["actions"]).float().to(device)
+        r = run_episode(abm_model, abm_planner, slots, actions, goal_slots,
+                        shift_alpha=args.shift, system_m=True, optimizer=optimizer,
+                        surprise_threshold=args.threshold,
+                        adaptation_steps=args.adapt_steps, device=device)
+        abm_results.append(r)
+        logging.info(f"  {key}: surprise={r['mean_surprise']:.4f}  plan_err={r['mean_plan_err']:.4f}  adaptations={r['adapt_count']}")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    frozen_pe = np.mean([r["mean_plan_err"]  for r in frozen_results])
+    abm_pe    = np.mean([r["mean_plan_err"]  for r in abm_results])
+    frozen_sr = np.mean([r["mean_surprise"]  for r in frozen_results])
+    abm_sr    = np.mean([r["mean_surprise"]  for r in abm_results])
+    total_ada = sum(r["adapt_count"] for r in abm_results)
+
+    logging.info("")
+    logging.info("=" * 55)
+    logging.info(f"  OOD shift alpha = {args.shift}")
+    logging.info(f"  {'':20s}  {'Frozen':>10s}  {'A-B-M':>10s}")
+    logging.info(f"  {'Mean surprise':20s}  {frozen_sr:>10.4f}  {abm_sr:>10.4f}")
+    logging.info(f"  {'Mean plan error':20s}  {frozen_pe:>10.4f}  {abm_pe:>10.4f}")
+    logging.info(f"  {'Improvement':20s}  {'—':>10s}  {frozen_pe/abm_pe:>9.2f}x")
+    logging.info(f"  Total System M adaptations: {total_ada}")
+    logging.info("=" * 55)
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="/workspace/checkpoints/mechjepa_pusht_act_best.ckpt")
-    parser.add_argument("--encoder", type=str, default="/workspace/data/pusht_videosaur_model.ckpt")
-    parser.add_argument("--data", type=str, default="/workspace/data/pusht_slots_actions.pkl")
-    args = parser.parse_args()
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    run_abm_demo(args.ckpt, args.encoder, args.data, device=device)
+    main()
