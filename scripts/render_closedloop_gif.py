@@ -415,14 +415,12 @@ def run_episode(ep_actions, init_state, goal_state,
         if len(tr_a) > TRAIL_LEN: tr_a.pop(0)
 
         # ── Frozen CEM: encode current env_f frame ────────────────────────────
-        frame_f = env_f.observations['image'][0]  # (H, W, 3) or (C, H, W)
-        if frame_f.shape[0] == 3: frame_f = frame_f.transpose(1,2,0)
+        frame_f = env_f.envs.envs[0].render()  # (H, W, 3) uint8 RGB
         fz_action, surp_f, _ = frozen_cem.step(frame_f.astype(np.uint8))
         fz_pol._a = fz_action
 
         # ── A-B-M CEM: encode current env_a frame ────────────────────────────
-        frame_a = env_a.observations['image'][0]
-        if frame_a.shape[0] == 3: frame_a = frame_a.transpose(1,2,0)
+        frame_a = env_a.envs.envs[0].render()  # (H, W, 3) uint8 RGB
         ab_action, surp_a, adapted = abm_cem.step(frame_a.astype(np.uint8))
         ab_pol._a = ab_action
 
