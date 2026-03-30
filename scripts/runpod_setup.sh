@@ -43,7 +43,7 @@ pip install -q 'torchmetrics<1.0' pycocotools webdataset huggingface_hub
 
 # ── 4. Install third-party libraries (for ALOE) ──
 echo "[4/7] Installing third-party libraries..."
-cd "$WORKSPACE/cjepa/cjepa/src/third_party"
+cd "$WORKSPACE/cjepa/src/third_party"
 
 if [ ! -d "stable-pretraining" ]; then
     git clone --quiet https://github.com/galilai-group/stable-pretraining.git
@@ -71,8 +71,8 @@ cd "$WORKSPACE"
 # ── 5. Patch torchcodec (crashes on many CUDA versions) ──
 echo "[5/7] Patching torchcodec imports..."
 pip uninstall torchcodec -y 2>/dev/null || true
-cd "$WORKSPACE/cjepa/cjepa"
-PYTHONPATH="$WORKSPACE/cjepa/cjepa" python scripts/ctt/fix_torchcodec.py
+cd "$WORKSPACE/cjepa"
+PYTHONPATH="$WORKSPACE/cjepa" python scripts/ctt/fix_torchcodec.py
 cd "$WORKSPACE"
 
 # ── 6. Download data ──
@@ -94,7 +94,7 @@ else
 fi
 
 # 6b. CLEVRER question JSONs (for ALOE VQA) — already in cjepa repo
-if [ -d "$WORKSPACE/cjepa/cjepa/dataset/clevrer/questions" ]; then
+if [ -d "$WORKSPACE/cjepa/dataset/clevrer/questions" ]; then
     echo "  CLEVRER questions already available in cjepa repo"
 else
     echo "  WARNING: CLEVRER questions not found in cjepa repo"
@@ -121,8 +121,8 @@ print('  MechJEPA imports OK!')
 "
 
 # Verify ALOE
-cd "$WORKSPACE/cjepa/cjepa"
-PYTHONPATH="$WORKSPACE/cjepa/cjepa" python -c "
+cd "$WORKSPACE/cjepa"
+PYTHONPATH="$WORKSPACE/cjepa" python -c "
 from src.third_party.slotformer.clevrer_vqa.datasets.clevrer import CLEVRERSlotsVQADataset
 from nerv.training import BaseDataModule
 print('  ALOE imports OK!')
