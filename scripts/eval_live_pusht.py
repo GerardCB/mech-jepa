@@ -131,26 +131,21 @@ def main():
         reset_opts["variation"] = ["block.scale"]
         logging.info(f"OOD mode: block.scale = {args.ood_block_scale}")
 
-    # ── Load dataset for evaluate_from_dataset ────────────────────────────────
-    logging.info("Loading Push-T expert dataset...")
-    dataset = swm.Dataset("swm/PushT-v1")
-
-    # Episode indices and start steps
-    ep_indices = list(range(args.episodes))
-    start_steps = [0] * args.episodes
+    def make_world():
+        return swm.World(
+            "swm/PushT-v1",
+            num_envs=1,
+            image_shape=img_shape,
+            max_episode_steps=args.max_steps,
+            goal_conditioned=True,
+            verbose=0,
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Condition 1: Frozen model
+    # Condition 1: Frozen model (no System M)
     # ══════════════════════════════════════════════════════════════════════════
     logging.info("▶ Condition 1: Frozen model (no System M)")
-    world_frozen = swm.World(
-        "swm/PushT-v1",
-        num_envs=1,
-        image_shape=img_shape,
-        max_episode_steps=args.max_steps,
-        goal_conditioned=True,
-        verbose=0,
-    )
+    world_frozen = make_world()
     world_frozen.set_policy(frozen_policy)
 
     if args.video_only:
@@ -162,31 +157,29 @@ def main():
         )
         logging.info(f"Saved Frozen video to {frozen_vid}/")
     else:
-        results_frozen = world_frozen.evaluate_from_dataset(
-            dataset=dataset,
-            episodes_idx=ep_indices,
-            start_steps=start_steps,
-            goal_offset_steps=50,
-            eval_budget=args.max_steps,
-            save_video=True,
-            video_path=os.path.join(args.out_dir, "frozen"),
+        # Standard SWM online evaluation (same as LeWorldModel benchmark)
+        results_frozen = world_frozen.evaluate(
+            episodes=args.episodes,
+            seed=42,
+            options=reset_opts or None,
         )
         logging.info(f"Frozen results: {results_frozen}")
 
+    # Also record a video for visualization
+    frozen_vid = os.path.join(args.out_dir, "frozen")
+    os.makedirs(frozen_vid, exist_ok=True)
+    world_frozen.record_video(
+        frozen_vid, max_steps=args.max_steps, fps=12,
+        extension="gif", options=reset_opts or None,
+    )
+    logging.info(f"Saved Frozen video to {frozen_vid}/")
     world_frozen.close()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Condition 2: A-B-M model (System M active)
     # ══════════════════════════════════════════════════════════════════════════
     logging.info("▶ Condition 2: A-B-M Agent (System M active)")
-    world_abm = swm.World(
-        "swm/PushT-v1",
-        num_envs=1,
-        image_shape=img_shape,
-        max_episode_steps=args.max_steps,
-        goal_conditioned=True,
-        verbose=0,
-    )
+    world_abm = make_world()
     world_abm.set_policy(abm_policy)
 
     if args.video_only:
@@ -198,20 +191,24 @@ def main():
         )
         logging.info(f"Saved A-B-M video to {abm_vid}/")
     else:
-        results_abm = world_abm.evaluate_from_dataset(
-            dataset=dataset,
-            episodes_idx=ep_indices,
-            start_steps=start_steps,
-            goal_offset_steps=50,
-            eval_budget=args.max_steps,
-            save_video=True,
-            video_path=os.path.join(args.out_dir, "abm"),
+        results_abm = world_abm.evaluate(
+            episodes=args.episodes,
+            seed=42,
+            options=reset_opts or None,
         )
         logging.info(f"A-B-M results: {results_abm}")
 
+    # Also record a video
+    abm_vid = os.path.join(args.out_dir, "abm")
+    os.makedirs(abm_vid, exist_ok=True)
+    world_abm.record_video(
+        abm_vid, max_steps=args.max_steps, fps=12,
+        extension="gif", options=reset_opts or None,
+    )
+    logging.info(f"Saved A-B-M video to {abm_vid}/")
     world_abm.close()
 
-    # ── System M metrics ──────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
     if not args.video_only:
         abm_metrics = abm_policy.get_metrics()
         logging.info(f"System M metrics: {abm_metrics}")
