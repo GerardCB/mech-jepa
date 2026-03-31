@@ -4,15 +4,13 @@ MechJEPA Cost Model — SWM-compatible interface for planning.
 Implements the `Costable` protocol required by SWM's CEMSolver:
     get_cost(info_dict, action_candidates) → costs
 
-The cost is the MSE between the predicted final slot state and the goal
-slot state, computed by rolling out MechJEPA in latent space for each
-candidate action sequence.
+SWM's CEM solver expands info_dict so that:
+  - info_dict['pixels'] has shape (n_envs, n_samples, H, W, C)
+  - action_candidates has shape (n_envs, n_samples, horizon, action_dim)
+  - returned costs must be (n_envs, n_samples) — 2D
 
-Architecture note:
-    SWM's CEMSolver calls get_cost multiple times per env step (once per
-    CEM iteration). We must NOT modify internal state (history) inside
-    get_cost. Instead we cache the encoded slots and only update history
-    when update_step() is called after the action is committed.
+The pixels are identical across n_samples (same observation replicated).
+We only encode pixels[:, 0] and expand in latent space.
 
 Usage with SWM:
     from stable_worldmodel.solver import CEMSolver
@@ -29,13 +27,6 @@ import numpy as np
 class MechJEPACostModel(nn.Module):
     """
     Wraps MechJEPA + VideoSAUR encoder for use with SWM's CEMSolver.
-
-    The solver calls `get_cost(info_dict, action_candidates)` with:
-      - info_dict['pixels']:  current obs  (n_envs, ...)
-      - info_dict['goal']:    goal obs     (n_envs, ...)
-      - action_candidates:    (n_envs, n_samples, horizon, action_dim) float32
-
-    Returns costs: (n_envs, n_samples, 1) — lower is better.
     """
 
     def __init__(self, world_model: nn.Module, encoder: nn.Module,
@@ -45,14 +36,14 @@ class MechJEPACostModel(nn.Module):
         self.encoder = encoder
         self.history_len = history_len
 
-        # Rolling history (updated externally via update_step, NOT in get_cost)
+        # Rolling history (updated via auto-commit in get_cost)
         self._slot_history: list[torch.Tensor] = []   # list of (n_envs, S, D)
         self._action_history: list[torch.Tensor] = []  # list of (n_envs, act_dim)
 
-        # Cache: encoded once per step, reused across CEM iterations
+        # Per-step cache
         self._cached_curr_slots: torch.Tensor | None = None
         self._cached_goal_slots: torch.Tensor | None = None
-        self._cached_info_id: int | None = None
+        self._step_counter: int = 0
 
     def reset(self):
         """Clear history at episode start."""
@@ -60,111 +51,93 @@ class MechJEPACostModel(nn.Module):
         self._action_history.clear()
         self._cached_curr_slots = None
         self._cached_goal_slots = None
-        self._cached_info_id = None
+        self._step_counter = 0
 
-    def _encode_pixels(self, pixels: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Encode a batch of pixel observations into slots.
+    def _encode_single(self, frame_hwc: np.ndarray) -> torch.Tensor:
+        """Encode a single (H, W, C) frame into slots (S, D)."""
+        return self.encoder.encode(frame_hwc.astype(np.uint8))
 
-        Args:
-            pixels: various shapes from SWM, e.g. (n_envs, 1, H, W, C) or (n_envs, H, W, C)
-        Returns:
-            slots: (n_envs, S, D)
-        """
+    def _encode_batch(self, pixels: np.ndarray) -> torch.Tensor:
+        """Encode (N, H, W, C) batch of frames into (N, S, D) slots."""
+        slots_list = []
+        for i in range(pixels.shape[0]):
+            s = self._encode_single(pixels[i])
+            slots_list.append(s.unsqueeze(0))
+        return torch.cat(slots_list, dim=0)
+
+    def _to_nhwc(self, pixels) -> np.ndarray:
+        """Convert any SWM pixel format to (N, H, W, C) numpy uint8."""
         if isinstance(pixels, torch.Tensor):
             pixels = pixels.cpu().numpy()
 
-        # Squeeze extra leading dims until (N, H, W, C) or (N, C, H, W)
-        while pixels.ndim > 4:
-            pixels = pixels.squeeze(1) if pixels.shape[1] == 1 else pixels.reshape(-1, *pixels.shape[-3:])
+        # SWM passes (n_envs, n_samples, H, W, C) — take first sample
+        if pixels.ndim == 5:
+            pixels = pixels[:, 0]  # (n_envs, H, W, C) — all samples are identical
 
         # Handle (N, C, H, W) → (N, H, W, C)
         if pixels.ndim == 4 and pixels.shape[1] in (1, 3):
             pixels = pixels.transpose(0, 2, 3, 1)
 
-        # Handle single image (H, W, C) → (1, H, W, C)
+        # Handle single image (H, W, C)
         if pixels.ndim == 3:
             pixels = pixels[np.newaxis]
 
-        slots_list = []
-        for i in range(pixels.shape[0]):
-            s = self.encoder.encode(pixels[i].astype(np.uint8))  # (S, D)
-            slots_list.append(s.unsqueeze(0))
-        return torch.cat(slots_list, dim=0)  # (n_envs, S, D)
-
-    def _get_history_tensors(self, n_envs: int, action_dim: int, device: torch.device):
-        """Build padded history tensors for rollout.
-
-        Returns:
-            history: (n_envs, history_len, S, D)
-            action_hist: (n_envs, history_len, action_dim)
-        """
-        # Pad slot history if needed
-        slot_hist = list(self._slot_history)
-        while len(slot_hist) < self.history_len:
-            slot_hist.insert(0, slot_hist[0] if slot_hist else
-                             torch.zeros(n_envs, 4, 128, device=device))
-
-        # Pad action history if needed
-        act_hist = list(self._action_history)
-        while len(act_hist) < self.history_len:
-            act_hist.insert(0, torch.zeros(n_envs, action_dim, device=device))
-
-        history = torch.stack(slot_hist[-self.history_len:], dim=1).to(device)
-        action_hist = torch.stack(act_hist[-self.history_len:], dim=1).to(device)
-        return history, action_hist
+        return pixels
 
     @torch.no_grad()
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
         """
         Evaluate candidate action sequences by rolling out the world model.
 
-        This is called MULTIPLE times per env step by CEMSolver (once per
-        CEM iteration). We cache the encoded slots so encoding happens only once.
-        When a NEW observation arrives, we auto-commit the previous cached
-        slots to history (so both Frozen and ABM policies maintain history).
+        Called by SWM's CEMSolver with:
+          - info_dict['pixels']:  (n_envs, n_samples, H, W, C) — replicated
+          - info_dict['goal']:    (n_envs, n_samples, H, W, C) — replicated
+          - action_candidates:    (n_envs, n_samples, horizon, action_dim)
 
-        Args:
-            info_dict: contains 'pixels' and 'goal' observations
-            action_candidates: (n_envs, n_samples, horizon, action_dim)
         Returns:
-            costs: (n_envs, n_samples, 1)
+          costs: (n_envs, n_samples) — 2D tensor, lower is better.
         """
         device = action_candidates.device
         n_envs, n_samples, horizon, action_dim = action_candidates.shape
 
-        # Detect new step: if info changed, commit previous step to history
-        info_id = id(info_dict.get('pixels', None))
-        if self._cached_info_id != info_id:
-            # Commit previous cached slots to history (if any)
+        # Encode ONCE per step (all n_samples have the same pixels)
+        pixels_nhwc = self._to_nhwc(info_dict['pixels'])  # (n_envs, H, W, C)
+        goal_nhwc = self._to_nhwc(info_dict['goal'])      # (n_envs, H, W, C)
+
+        # Detect new step via pixel hash (CEM calls get_cost multiple times
+        # per step with the same pixels — avoid re-encoding + re-committing)
+        pixel_hash = hash(pixels_nhwc.tobytes())
+
+        if pixel_hash != self._step_counter:  # _step_counter stores last hash
+            # New observation → commit previous to history, then encode
             if self._cached_curr_slots is not None:
                 self._slot_history.append(self._cached_curr_slots.detach())
                 if len(self._slot_history) > self.history_len:
                     self._slot_history.pop(0)
-                # Also commit a zero action if no action was committed
+                # Zero action placeholder (replaced by update_step if ABM)
                 if len(self._action_history) < len(self._slot_history):
                     self._action_history.append(
-                        torch.zeros(self._cached_curr_slots.shape[0], action_dim, device=device)
+                        torch.zeros(n_envs, action_dim, device=device)
                     )
                     if len(self._action_history) > self.history_len:
                         self._action_history.pop(0)
 
-            # Encode new observation
-            self._cached_curr_slots = self._encode_pixels(info_dict['pixels']).to(device)
-            self._cached_goal_slots = self._encode_pixels(info_dict['goal']).to(device)
-            self._cached_info_id = info_id
+            self._cached_curr_slots = self._encode_batch(pixels_nhwc).to(device)
+            self._cached_goal_slots = self._encode_batch(goal_nhwc).to(device)
+            self._step_counter = pixel_hash
 
         curr_slots = self._cached_curr_slots  # (n_envs, S, D)
         goal_slots = self._cached_goal_slots  # (n_envs, S, D)
         S, D = curr_slots.shape[1], curr_slots.shape[2]
 
-        # Build history including current slots (temporary, NOT persisted)
+        # Build history: existing + current, padded to history_len
         temp_history = list(self._slot_history) + [curr_slots]
         while len(temp_history) < self.history_len:
             temp_history.insert(0, temp_history[0])
         temp_history = temp_history[-self.history_len:]
         history = torch.stack(temp_history, dim=1).to(device)  # (n_envs, T, S, D)
 
-        # Action history (padded)
+        # Action history, padded
         temp_acts = list(self._action_history)
         while len(temp_acts) < self.history_len:
             temp_acts.insert(0, torch.zeros(n_envs, action_dim, device=device))
@@ -185,50 +158,42 @@ class MechJEPACostModel(nn.Module):
         curr_acts = ahist_exp
 
         for h in range(horizon):
-            step_act = flat_actions[:, h:h+1, :]  # (B, 1, act_dim)
+            step_act = flat_actions[:, h:h+1, :]
             curr_acts = torch.cat([curr_acts[:, 1:, :], step_act], dim=1)
             next_pred = self.model.inference(
                 curr_history, actions=curr_acts
-            )  # (B, 1, S, D)
+            )
             curr_history = torch.cat([curr_history[:, 1:], next_pred], dim=1)
 
-        # Final predicted state
-        final_pred = curr_history[:, -1, :, :]  # (n_envs * n_samples, S, D)
+        # Final predicted state: (n_envs * n_samples, S, D)
+        final_pred = curr_history[:, -1, :, :]
 
-        # Expand goal
+        # Expand goal: (n_envs * n_samples, S, D)
         goal_exp = goal_slots.unsqueeze(1).expand(-1, n_samples, -1, -1)
         goal_exp = goal_exp.reshape(n_envs * n_samples, S, D).to(device)
 
-        # Cost = MSE to goal
+        # Cost = MSE to goal — returns (n_envs, n_samples) 2D
         costs = (final_pred - goal_exp).pow(2).mean(dim=(1, 2))
-        costs = costs.reshape(n_envs, n_samples, 1)
+        costs = costs.reshape(n_envs, n_samples)
 
         return costs
 
     def update_step(self, action: np.ndarray | torch.Tensor):
-        """Update history after an action is committed to the environment.
+        """Update action history after committing an action.
 
-        Call this AFTER the action has been executed in the env, to register
-        the current observation and action in the rolling history.
-
-        Args:
-            action: (n_envs, action_dim) numpy or tensor
+        Called by ABMPolicy after get_action() — for Frozen policy this
+        is handled automatically by the auto-commit in get_cost().
         """
-        # Add current slots to history (from cache)
-        if self._cached_curr_slots is not None:
-            self._slot_history.append(self._cached_curr_slots.detach())
-            if len(self._slot_history) > self.history_len:
-                self._slot_history.pop(0)
-
-        # Add action to history
         if isinstance(action, np.ndarray):
             action = torch.from_numpy(action).float()
-        self._action_history.append(action)
-        if len(self._action_history) > self.history_len:
-            self._action_history.pop(0)
 
-        # Invalidate cache for next step
-        self._cached_info_id = None
+        # Replace the zero-action placeholder with the actual action
+        if self._action_history:
+            self._action_history[-1] = action
+        else:
+            self._action_history.append(action)
+            if len(self._action_history) > self.history_len:
+                self._action_history.pop(0)
 
     # Legacy alias
     def update_action_history(self, action):
