@@ -141,7 +141,8 @@ class MechJEPACostModel(nn.Module):
         temp_acts = list(self._action_history)
         while len(temp_acts) < self.history_len:
             temp_acts.insert(0, torch.zeros(n_envs, action_dim, device=device))
-        action_hist = torch.stack(temp_acts[-self.history_len:], dim=1).to(device)
+        temp_acts = [a.to(device) for a in temp_acts[-self.history_len:]]
+        action_hist = torch.stack(temp_acts, dim=1)
 
         # Expand for n_samples: (n_envs * n_samples, T, S, D)
         hist_exp = history.unsqueeze(1).expand(-1, n_samples, -1, -1, -1)
