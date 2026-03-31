@@ -82,9 +82,9 @@ MechanismCodebook         ← Retrieve: m_ij = close mechanism for each slot pai
       ▼
 MechSlotPredictor (JEPA)  ← Predict: ẑ_{t+1} (action-conditioned via AdaLN)
       │
-      ├──▶ CEMPlanner      ← System B: optimise action sequence toward goal
+      ├──▶ CEMSolver (SWM)  ← System B: optimise action sequence toward goal
       │
-      └──▶ SystemM         ← Monitor: if surprise(ẑ, z) > τ → take adaptation steps
+      └──▶ ABMPolicy         ← System M: if surprise(ẑ, z) > τ → online adaptation
 ```
 
 ### Key Components
@@ -95,7 +95,8 @@ MechSlotPredictor (JEPA)  ← Predict: ẑ_{t+1} (action-conditioned via AdaLN)
 | `MechanismCodebook` | `mechjepa/codebook.py` | VQ-based mechanism memory |
 | `MechSlotPredictor` | `mechjepa/dynamics.py` | Transformer predictor with AdaLN action conditioning |
 | `ActionAdaLN` | `mechjepa/dynamics.py` | Per-layer action modulation |
-| `CEMPlanner` | `mechjepa/planner.py` | Cross-Entropy Method for latent planning |
+| `MechJEPACostModel` | `mechjepa/cost_model.py` | SWM-compatible cost model (`get_cost`) |
+| `ABMPolicy` | `mechjepa/abm_policy.py` | System M policy (extends SWM `WorldModelPolicy`) |
 | `SystemM` | `mechjepa/system_m.py` | Surprise monitor & adaptation trigger |
 | `VideoSAUREncoder` | `mechjepa/encoder.py` | Pixel → slot encoder (VideoSAUR/C-JEPA) |
 
@@ -184,7 +185,8 @@ mech-jepa/
 │   ├── model.py          # MechJEPA (top-level)
 │   ├── dynamics.py       # MechSlotPredictor + ActionAdaLN
 │   ├── codebook.py       # MechanismCodebook (VQ)
-│   ├── planner.py        # CEMPlanner (System B)
+│   ├── cost_model.py     # MechJEPACostModel (SWM get_cost interface)
+│   ├── abm_policy.py     # ABMPolicy (System M + SWM WorldModelPolicy)
 │   ├── system_m.py       # SystemM (surprise monitor)
 │   ├── encoder.py        # VideoSAUREncoder (pixel → slots)
 │   └── data/
