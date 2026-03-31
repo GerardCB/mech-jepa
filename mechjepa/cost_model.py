@@ -120,6 +120,8 @@ class MechJEPACostModel(nn.Module):
 
         This is called MULTIPLE times per env step by CEMSolver (once per
         CEM iteration). We cache the encoded slots so encoding happens only once.
+        When a NEW observation arrives, we auto-commit the previous cached
+        slots to history (so both Frozen and ABM policies maintain history).
 
         Args:
             info_dict: contains 'pixels' and 'goal' observations
@@ -130,9 +132,23 @@ class MechJEPACostModel(nn.Module):
         device = action_candidates.device
         n_envs, n_samples, horizon, action_dim = action_candidates.shape
 
-        # Cache encoding (only encode once per env step)
+        # Detect new step: if info changed, commit previous step to history
         info_id = id(info_dict.get('pixels', None))
         if self._cached_info_id != info_id:
+            # Commit previous cached slots to history (if any)
+            if self._cached_curr_slots is not None:
+                self._slot_history.append(self._cached_curr_slots.detach())
+                if len(self._slot_history) > self.history_len:
+                    self._slot_history.pop(0)
+                # Also commit a zero action if no action was committed
+                if len(self._action_history) < len(self._slot_history):
+                    self._action_history.append(
+                        torch.zeros(self._cached_curr_slots.shape[0], action_dim, device=device)
+                    )
+                    if len(self._action_history) > self.history_len:
+                        self._action_history.pop(0)
+
+            # Encode new observation
             self._cached_curr_slots = self._encode_pixels(info_dict['pixels']).to(device)
             self._cached_goal_slots = self._encode_pixels(info_dict['goal']).to(device)
             self._cached_info_id = info_id
