@@ -70,11 +70,11 @@ class MechJEPACostModel(nn.Module):
         if isinstance(pixels, torch.Tensor):
             pixels = pixels.cpu().numpy()
 
-        # SWM passes (n_envs, n_samples, H, W, C) — take first sample
-        if pixels.ndim == 5:
-            pixels = pixels[:, 0]  # (n_envs, H, W, C) — all samples are identical
+        # Squeeze extra leading dims until 4D: (N, H, W, C)
+        while pixels.ndim > 4:
+            pixels = pixels[:, 0]
 
-        # Handle (N, C, H, W) → (N, H, W, C)
+        # Handle (N, C, H, W) -> (N, H, W, C)
         if pixels.ndim == 4 and pixels.shape[1] in (1, 3):
             pixels = pixels.transpose(0, 2, 3, 1)
 
