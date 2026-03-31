@@ -164,9 +164,9 @@ class ABMPolicy(WorldModelPolicy):
             actions: (n_envs, action_dim) numpy array
         """
         # Encode current observation for surprise computation
-        curr_slots = self.cost_model._encode_pixels(info_dict['pixels'])
         device = next(self.world_model.parameters()).device
-        curr_slots = curr_slots.to(device)
+        pixels_nhwc = self.cost_model._to_nhwc(info_dict['pixels'])
+        curr_slots = self.cost_model._encode_batch(pixels_nhwc).to(device)
 
         # System M: check surprise and adapt if needed
         surprise = self._compute_surprise(curr_slots)
