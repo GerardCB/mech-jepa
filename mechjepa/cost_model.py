@@ -52,16 +52,24 @@ class MechJEPACostModel(nn.Module):
         """Encode a batch of pixel observations into slots.
 
         Args:
-            pixels: (n_envs, C, H, W) or (n_envs, H, W, C) uint8
+            pixels: various shapes from SWM, e.g. (n_envs, 1, H, W, C) or (n_envs, H, W, C)
         Returns:
             slots: (n_envs, S, D)
         """
         if isinstance(pixels, torch.Tensor):
             pixels = pixels.cpu().numpy()
 
-        # Handle both (N, C, H, W) and (N, H, W, C)
+        # Squeeze extra leading dims until we have (N, H, W, C) or (N, C, H, W)
+        while pixels.ndim > 4:
+            pixels = pixels.squeeze(1) if pixels.shape[1] == 1 else pixels.reshape(-1, *pixels.shape[-3:])
+
+        # Handle (N, C, H, W) → (N, H, W, C)
         if pixels.ndim == 4 and pixels.shape[1] in (1, 3):
-            pixels = pixels.transpose(0, 2, 3, 1)  # NCHW → NHWC
+            pixels = pixels.transpose(0, 2, 3, 1)
+
+        # Handle single image (H, W, C) → (1, H, W, C)
+        if pixels.ndim == 3:
+            pixels = pixels[np.newaxis]
 
         slots_list = []
         for i in range(pixels.shape[0]):
