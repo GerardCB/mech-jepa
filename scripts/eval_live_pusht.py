@@ -125,6 +125,24 @@ def main():
         threshold=args.threshold,
     )
 
+    class ActionUnnormalizeWrapper:
+        def __init__(self, policy):
+            self.policy = policy
+            # SWM dataset standardizes actions; we must reverse to [-1, 1] for the env
+            self.mean = np.array([-0.00781256, 0.00686054], dtype=np.float32)
+            self.std = np.array([0.20822126, 0.20650564], dtype=np.float32)
+
+        def get_action(self, *args, **kwargs):
+            acts = self.policy.get_action(*args, **kwargs)
+            unnorm = acts * self.std + self.mean
+            return np.clip(unnorm, -1.0, 1.0)
+        
+        def __getattr__(self, name):
+            return getattr(self.policy, name)
+
+    frozen_policy = ActionUnnormalizeWrapper(frozen_policy)
+    abm_policy = ActionUnnormalizeWrapper(abm_policy)
+
     # ── Reset options (OOD variation) ─────────────────────────────────────────
     reset_opts = {}
     if args.ood_block_scale is not None:

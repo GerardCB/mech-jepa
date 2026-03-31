@@ -173,8 +173,14 @@ class MechJEPACostModel(nn.Module):
         goal_exp = goal_slots.unsqueeze(1).expand(-1, n_samples, -1, -1)
         goal_exp = goal_exp.reshape(n_envs * n_samples, S, D).to(device)
 
-        # Cost = MSE to goal — returns (n_envs, n_samples) 2D
-        costs = (final_pred - goal_exp).pow(2).mean(dim=(1, 2))
+        # Cost = Permutation-invariant Chamfer-style distance to goal
+        # Since slots are unordered, naive element-wise MSE fails.
+        # Compute pairwise distances: (B, S, S)
+        dists = torch.cdist(final_pred, goal_exp)
+        # For each predicted slot, find the closest goal slot distance, and average them
+        costs = dists.min(dim=2).values.mean(dim=1)
+        
+        # Returns (n_envs, n_samples) 2D
         costs = costs.reshape(n_envs, n_samples)
 
         return costs
